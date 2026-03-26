@@ -1,7 +1,7 @@
-FROM nvidia/cuda:12.9.1-base-ubuntu22.04 
+FROM nvidia/cuda:12.9.1-devel-ubuntu22.04
 
 RUN apt-get update -y \
-    && apt-get install -y python3-pip
+    && apt-get install -y python3-pip ninja-build cmake
 
 RUN ldconfig /usr/local/cuda-12.9/compat/
 
@@ -17,7 +17,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade -r /requirements.txt
 
 # Setup for Option 2: Building the Image with the Model included
-ARG MODEL_NAME=""
+ARG MODEL_NAME="Qwen/Qwen3.5-27B"
 ARG TOKENIZER_NAME=""
 ARG BASE_PATH="/runpod-volume"
 ARG QUANTIZATION=""

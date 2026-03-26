@@ -321,9 +321,8 @@ class OpenAIvLLMEngine(vLLMEngine):
             generator_function = self.completion_engine.create_completion
         
         try:
-            request = request_class(
-                **openai_request.openai_input
-            )
+            openai_input = {**openai_request.openai_input, "model": self.served_model_name}
+            request = request_class(**openai_input)
         except Exception as e:
             yield create_error_response(str(e)).model_dump()
             return
