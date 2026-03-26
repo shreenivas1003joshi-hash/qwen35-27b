@@ -231,6 +231,8 @@ class OpenAIvLLMEngine(vLLMEngine):
             logging.info("OpenAI serving engines initialized successfully")
 
     async def _initialize_engines(self):
+        from vllm.entrypoints.serve.render.serving import OpenAIServingRender
+
         self.model_config = self.llm.model_config
         self.base_model_paths = [
             BaseModelPath(name=self.served_model_name, model_path=self.engine_args.model)
@@ -242,16 +244,31 @@ class OpenAIvLLMEngine(vLLMEngine):
             lora_modules=self.lora_adapters,
         )
         await self.serving_models.init_static_loras()
-        
-        # Get chat template from vLLM tokenizer if available
+
         chat_template = None
         if self.tokenizer and hasattr(self.tokenizer, 'tokenizer'):
             chat_template = self.tokenizer.tokenizer.chat_template
-        
+
+        openai_serving_render = OpenAIServingRender(
+            model_config=self.llm.model_config,
+            renderer=self.llm.renderer,
+            io_processor=self.llm.io_processor,
+            model_registry=self.serving_models.registry,
+            request_logger=None,
+            chat_template=chat_template,
+            chat_template_content_format="auto",
+            trust_request_chat_template=os.getenv('TRUST_REQUEST_CHAT_TEMPLATE', 'false').lower() == 'true',
+            enable_auto_tools=os.getenv('ENABLE_AUTO_TOOL_CHOICE', 'false').lower() == 'true',
+            exclude_tools_when_tool_choice_none=os.getenv('EXCLUDE_TOOLS_WHEN_TOOL_CHOICE_NONE', 'false').lower() == 'true',
+            tool_parser=os.getenv('TOOL_CALL_PARSER', "") or None,
+            log_error_stack=os.getenv('LOG_ERROR_STACK', 'false').lower() == 'true',
+        )
+
         self.chat_engine = OpenAIServingChat(
-            engine_client=self.llm, 
+            engine_client=self.llm,
             models=self.serving_models,
             response_role=self.response_role,
+            openai_serving_render=openai_serving_render,
             request_logger=None,
             chat_template=chat_template,
             chat_template_content_format="auto",
@@ -265,9 +282,11 @@ class OpenAIvLLMEngine(vLLMEngine):
             enable_force_include_usage=os.getenv('ENABLE_FORCE_INCLUDE_USAGE', 'false').lower() == 'true',
             enable_log_outputs=os.getenv('ENABLE_LOG_OUTPUTS', 'false').lower() == 'true',
         )
+
         self.completion_engine = OpenAIServingCompletion(
             engine_client=self.llm,
             models=self.serving_models,
+            openai_serving_render=openai_serving_render,
             request_logger=None,
             return_tokens_as_token_ids=os.getenv('RETURN_TOKENS_AS_TOKEN_IDS', 'false').lower() == 'true',
             enable_prompt_tokens_details=os.getenv('ENABLE_PROMPT_TOKENS_DETAILS', 'false').lower() == 'true',
