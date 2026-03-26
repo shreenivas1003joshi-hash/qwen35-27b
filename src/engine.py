@@ -264,7 +264,6 @@ class OpenAIvLLMEngine(vLLMEngine):
             enable_prompt_tokens_details=os.getenv('ENABLE_PROMPT_TOKENS_DETAILS', 'false').lower() == 'true',
             enable_force_include_usage=os.getenv('ENABLE_FORCE_INCLUDE_USAGE', 'false').lower() == 'true',
             enable_log_outputs=os.getenv('ENABLE_LOG_OUTPUTS', 'false').lower() == 'true',
-            log_error_stack=os.getenv('LOG_ERROR_STACK', 'false').lower() == 'true',
         )
         self.completion_engine = OpenAIServingCompletion(
             engine_client=self.llm,
@@ -273,7 +272,6 @@ class OpenAIvLLMEngine(vLLMEngine):
             return_tokens_as_token_ids=os.getenv('RETURN_TOKENS_AS_TOKEN_IDS', 'false').lower() == 'true',
             enable_prompt_tokens_details=os.getenv('ENABLE_PROMPT_TOKENS_DETAILS', 'false').lower() == 'true',
             enable_force_include_usage=os.getenv('ENABLE_FORCE_INCLUDE_USAGE', 'false').lower() == 'true',
-            log_error_stack=os.getenv('LOG_ERROR_STACK', 'false').lower() == 'true',
         )
 
         if hasattr(self.chat_engine, 'warmup'):
