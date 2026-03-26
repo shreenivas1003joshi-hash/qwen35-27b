@@ -7,7 +7,7 @@ RUN ldconfig /usr/local/cuda-12.9/compat/
 
 # Install vLLM with FlashInfer - use CUDA 12.8 PyTorch wheels (compatible with vLLM 0.15.1)
 RUN python3 -m pip install --upgrade pip && \
-    python3 -m pip install "vllm[flashinfer]==0.16.0" --extra-index-url https://download.pytorch.org/whl/cu129
+    python3 -m pip install "vllm[flashinfer]==0.17.0" --extra-index-url https://download.pytorch.org/whl/cu129
 
 
 
@@ -23,7 +23,7 @@ ARG BASE_PATH="/runpod-volume"
 ARG QUANTIZATION=""
 ARG MODEL_REVISION=""
 ARG TOKENIZER_REVISION=""
-ARG VLLM_NIGHTLY="false"
+ARG VLLM_NIGHTLY="true"
 
 ENV MODEL_NAME=$MODEL_NAME \
     MODEL_REVISION=$MODEL_REVISION \
