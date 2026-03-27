@@ -5,10 +5,13 @@ import glob
 from shutil import rmtree
 from huggingface_hub import snapshot_download
 from utils import timer_decorator
+from runpod import RunPodLogger
 
 BASE_DIR = "/" 
 TOKENIZER_PATTERNS = [["*.json", "tokenizer*"]]
 MODEL_PATTERNS = [["*.safetensors"], ["*.bin"], ["*.pt"]]
+
+log = RunPodLogger()
 
 def setup_env():
     if os.getenv("TESTING_DOWNLOAD") == "1":
@@ -98,3 +101,14 @@ if __name__ == "__main__":
     
     with open(f"{BASE_DIR}/local_model_args.json", "w") as f:
         json.dump({k: v for k, v in metadata.items() if v not in (None, "")}, f)
+    
+    try:
+        from engine import vLLMEngine, OpenAIvLLMEngine
+        import sys
+
+        vllm_engine = vLLMEngine()
+        openai_engine = OpenAIvLLMEngine(vllm_engine)
+        log.info("vLLM engines initialized successfully")
+    except Exception as e:
+        log.error(f"Worker startup failed: {e}\n{traceback.format_exc()}")
+        sys.exit(1)
