@@ -84,40 +84,79 @@ def _has_config_json(path: str) -> bool:
     return os.path.isfile(os.path.join(path, "config.json"))
 
 
+def _resolve_hf_snapshot(hf_home: str, model_id: str) -> str | None:
+    """
+    Given an HF_HOME directory and a model ID like "Qwen/Qwen3.5-27B",
+    return the exact snapshot path so vLLM can load weights directly
+    without any network calls.
+
+    HF cache layout:
+      <hf_home>/hub/models--<org>--<name>/
+        refs/main          ← contains the commit hash
+        snapshots/<hash>/  ← actual model files
+    """
+    if "/" not in model_id:
+        return None
+    org, name = model_id.split("/", 1)
+    hub_dir = os.path.join(hf_home, "hub")
+    model_cache = os.path.join(hub_dir, f"models--{org}--{name}")
+
+    if not os.path.isdir(model_cache):
+        return None
+
+    # Prefer the hash recorded in refs/main
+    refs_main = os.path.join(model_cache, "refs", "main")
+    if os.path.isfile(refs_main):
+        try:
+            commit = open(refs_main).read().strip()
+            snap = os.path.join(model_cache, "snapshots", commit)
+            if _has_config_json(snap):
+                return snap
+        except OSError:
+            pass
+
+    # Fall back: pick newest snapshot directory that has a config.json
+    snaps_dir = os.path.join(model_cache, "snapshots")
+    if os.path.isdir(snaps_dir):
+        for snap in sorted(os.listdir(snaps_dir), reverse=True):
+            snap_path = os.path.join(snaps_dir, snap)
+            if _has_config_json(snap_path):
+                return snap_path
+
+    return None
+
+
 def _find_model_on_volume(volume_root: str, hint: str) -> str | None:
     """
-    Search `volume_root` for a directory that contains config.json.
+    Search common layouts under `volume_root` for a model directory.
 
     Search order:
-      1. Direct match:           <volume_root>/<hint>
-      2. Nested models folder:   <volume_root>/models/<hint>
-      3. HF snapshot cache:      <volume_root>/hub/models--<org>--<name>/snapshots/<hash>/
-      4. Any immediate child of  <volume_root>  that has a config.json
+      1. <volume_root>/<hint>  or  <volume_root>/<short_name>
+      2. <volume_root>/models/<hint | short_name>
+      3. HF snapshot via refs/main inside <volume_root>/hub/…
+      4. HF snapshot via refs/main inside <volume_root>/hf-cache/hub/…
+      5. Any immediate child that has a config.json
     """
-    # Normalise hint  "Qwen/Qwen3.5-27B"  →  "Qwen3.5-27B"
     short_name = hint.split("/")[-1] if "/" in hint else hint
 
+    # Plain directory candidates
     candidates = [
         os.path.join(volume_root, hint),
         os.path.join(volume_root, short_name),
         os.path.join(volume_root, "models", hint),
         os.path.join(volume_root, "models", short_name),
     ]
-
-    # HuggingFace snapshot cache layout:
-    #   <volume_root>/hub/models--Qwen--Qwen3.5-27B/snapshots/<hash>/
-    if "/" in hint:
-        org, name = hint.split("/", 1)
-        hf_model_dir = os.path.join(volume_root, "hub", f"models--{org}--{name}", "snapshots")
-        if os.path.isdir(hf_model_dir):
-            for snap in sorted(os.listdir(hf_model_dir)):
-                candidates.append(os.path.join(hf_model_dir, snap))
-
     for path in candidates:
         if _has_config_json(path):
             return path
 
-    # Last resort: any immediate child with config.json
+    # HF cache layouts — check both <volume_root> and <volume_root>/hf-cache as hf_home
+    for hf_home in [volume_root, os.path.join(volume_root, "hf-cache")]:
+        snap = _resolve_hf_snapshot(hf_home, hint)
+        if snap:
+            return snap
+
+    # Last resort: any direct child with config.json
     if os.path.isdir(volume_root):
         for child in sorted(os.listdir(volume_root)):
             child_path = os.path.join(volume_root, child)
@@ -127,54 +166,18 @@ def _find_model_on_volume(volume_root: str, hint: str) -> str | None:
     return None
 
 
-def _log_volume_tree(volume_root: str, depth: int = 2) -> None:
-    """Log the directory tree of the volume so the correct path is visible in logs."""
-    if not os.path.isdir(volume_root):
-        log.info(f"  (volume root {volume_root!r} does not exist)")
-        return
-    for root, dirs, files in os.walk(volume_root):
-        level = root.replace(volume_root, "").count(os.sep)
-        if level >= depth:
-            dirs.clear()
-            continue
-        indent = "  " * level
-        log.info(f"  {indent}{os.path.basename(root)}/")
-        if level == depth - 1:
-            for f in files[:6]:
-                log.info(f"  {indent}  {f}")
-            if len(files) > 6:
-                log.info(f"  {indent}  … ({len(files) - 6} more files)")
-
-
 def resolve_model_path() -> str | None:
     """
-    Return the final model path to pass to vLLM, or None to let config.yaml decide.
+    Return the exact local path to pass as --model to vLLM, or None.
 
     Priority:
-      1. MODEL_PATH env var — must point directly at a dir with config.json.
-      2. Auto-discover on VOLUME_PATH (default /runpod-volume) using the model
-         name from MODEL_NAME env var or config.yaml.
-      3. HF_HOME env var — handled separately via env; no path override needed.
+      1. MODEL_PATH env var — direct path to model dir with config.json.
+      2. HF_HOME env var  — resolve snapshot from the HF cache on the volume.
+      3. Auto-scan /runpod-volume (or VOLUME_PATH) for the model in config.yaml.
     """
     import yaml
 
-    volume_root = os.environ.get("VOLUME_PATH", "/runpod-volume")
-
-    # 1. Explicit path
-    explicit = os.environ.get("MODEL_PATH", "").strip()
-    if explicit:
-        if _has_config_json(explicit):
-            log.info(f"Model source: MODEL_PATH  →  {explicit}")
-            return explicit
-        # Path given but wrong — search inside it as a volume root too
-        log.warn(
-            f"MODEL_PATH={explicit!r} has no config.json. "
-            f"Scanning it and {volume_root!r} for the model …"
-        )
-        log.info(f"Contents of {explicit}:")
-        _log_volume_tree(explicit, depth=3)
-
-    # Read model name from env or config.yaml
+    # Read model hint from env or config.yaml
     try:
         with open(CONFIG_PATH) as f:
             config = yaml.safe_load(f) or {}
@@ -182,34 +185,65 @@ def resolve_model_path() -> str | None:
     except Exception:
         model_hint = os.environ.get("MODEL_NAME", "")
 
-    # 2. Auto-discover on the volume
-    if os.path.isdir(volume_root):
-        log.info(f"Scanning volume {volume_root!r} for model {model_hint!r} …")
-        _log_volume_tree(volume_root, depth=2)
+    # 1. Explicit local path
+    explicit = os.environ.get("MODEL_PATH", "").strip()
+    if explicit:
+        if _has_config_json(explicit):
+            log.info(f"Model source: MODEL_PATH  →  {explicit}")
+            return explicit
+        log.warn(f"MODEL_PATH={explicit!r} has no config.json — will try other locations.")
 
+    # 2. HF_HOME — resolve to the exact snapshot to avoid ANY network call
+    hf_home = os.environ.get("HF_HOME", "").strip()
+    if hf_home:
+        snap = _resolve_hf_snapshot(hf_home, model_hint)
+        if snap:
+            log.info(f"Model source: HF snapshot  →  {snap}")
+            return snap
+        log.warn(
+            f"HF_HOME={hf_home!r} is set but no snapshot found for {model_hint!r}. "
+            f"Expected: {hf_home}/hub/models--<org>--<name>/snapshots/<hash>/"
+        )
+
+    # 3. Auto-scan the volume
+    volume_root = os.environ.get("VOLUME_PATH", "/runpod-volume")
+    if os.path.isdir(volume_root):
+        log.info(f"Scanning {volume_root!r} for {model_hint!r} …")
         found = _find_model_on_volume(volume_root, model_hint)
         if found:
-            log.info(f"Model source: auto-discovered on volume  →  {found}")
+            log.info(f"Model source: auto-discovered  →  {found}")
             return found
-
         log.warn(
-            f"Could not find a directory with config.json on {volume_root!r}. "
-            f"Set MODEL_PATH=<exact path> or HF_HOME=<hf-cache path> in your RunPod env vars."
+            f"Model not found on volume. "
+            f"Set MODEL_PATH=<path> or HF_HOME=<hf-cache dir> in your RunPod env vars."
         )
     else:
-        log.warn(f"Volume root {volume_root!r} is not mounted. Falling back to HuggingFace download.")
+        log.warn(f"Volume {volume_root!r} not mounted — model will be downloaded from HuggingFace.")
 
-    return None  # fall back to config.yaml model (HF download)
+    return None
 
 
-def build_vllm_env() -> dict:
-    """Forward HF_HOME to the vLLM subprocess if set."""
+def build_vllm_env(model_path: str | None) -> dict:
+    """
+    Build the subprocess environment for vLLM.
+    When a local model path is resolved, HF_HUB_OFFLINE=1 is set so vLLM
+    never touches the network — which prevents 'Disk quota exceeded' errors
+    caused by HuggingFace trying to write update metadata.
+    """
     env = os.environ.copy()
+
     hf_home = os.environ.get("HF_HOME", "").strip()
     if hf_home:
         env["HF_HOME"] = hf_home
         env.setdefault("HF_DATASETS_CACHE", os.path.join(hf_home, "datasets"))
         log.info(f"HF_HOME  →  {hf_home}")
+
+    if model_path:
+        # Model is fully local — block all network access to HF Hub.
+        # This prevents 'Disk quota exceeded' from metadata writes.
+        env["HF_HUB_OFFLINE"] = "1"
+        env["TRANSFORMERS_OFFLINE"] = "1"
+        log.info("Offline mode: HF_HUB_OFFLINE=1, TRANSFORMERS_OFFLINE=1")
     return env
 
 
@@ -217,11 +251,11 @@ def start_vllm_server() -> subprocess.Popen:
     """
     Launch vLLM's OpenAI-compatible HTTP server as a child process.
     - tensor-parallel-size is clamped to available GPUs automatically.
-    - Model path is resolved from volume; falls back to HF download.
+    - Model path resolved to exact local snapshot; HF network disabled when local.
     """
     tp         = resolve_tensor_parallel_size()
-    env        = build_vllm_env()
     model_path = resolve_model_path()
+    env        = build_vllm_env(model_path)
 
     cmd = [
         sys.executable, "-m", "vllm.entrypoints.openai.api_server",
