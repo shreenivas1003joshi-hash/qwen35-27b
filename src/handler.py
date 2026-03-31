@@ -36,20 +36,10 @@ async def handler(job):
 # Only run in main process to prevent re-initialization when vLLM spawns worker subprocesses
 if __name__ == "__main__" or multiprocessing.current_process().name == "MainProcess":
 
-    try:
-        from engine import vLLMEngine, OpenAIvLLMEngine
-
-        vllm_engine = vLLMEngine()
-        openai_engine = OpenAIvLLMEngine(vllm_engine)
-        log.info("vLLM engines initialized successfully")
-    except Exception as e:
-        log.error(f"Worker startup failed: {e}\n{traceback.format_exc()}")
-        sys.exit(1)
-
     runpod.serverless.start(
         {
             "handler": handler,
-            "concurrency_modifier": lambda x: vllm_engine.max_concurrency if vllm_engine else 1,
+            "concurrency_modifier": 1,
             "return_aggregate_stream": True,
         }
     )
