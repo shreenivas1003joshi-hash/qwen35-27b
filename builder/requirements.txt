@@ -1,14 +1,5 @@
-ray
-pandas
-pyarrow
-runpod
-huggingface-hub
-packaging
-typing-extensions>=4.8.0
-pydantic
-pydantic-settings
-hf-transfer
-transformers>=4.57.0
-bitsandbytes>=0.45.0
-kernels
-torch-c-dlpack-ext
+# vLLM is already installed in the base image (vllm/vllm-openai:nightly)
+runpod>=1.7.0
+aiohttp>=3.9.0
+huggingface_hub>=0.24.0
+pyyaml>=6.0

@@ -1,0 +1,25 @@
+model:  Qwen/Qwen3.5-27B
+host: "0.0.0.0"
+port: 8001
+tensor-parallel-size: 4      
+max-model-len: 32768
+gpu-memory-utilization: 0.95 
+enable-reasoning: false
+
+attention-config.backend: flash_attn
+
+disable-log-stats: false
+uvicorn-log-level: info
+
+# tool-call-parser: 
+enable-auto-tool-choice: true
+tool-call-parser: qwen3_coder  
+
+# PARALLEL REQUEST OPTIMIZATION
+# max-num-seqs: 64  
+max-num-seqs: 16                    
+max-num-batched-tokens: 8192        
+enable-chunked-prefill: true       
+
+# disable multi modal
+language-model-only: true
