@@ -80,48 +80,136 @@ def resolve_tensor_parallel_size() -> int:
     return requested
 
 
-def build_vllm_env() -> dict:
+def _has_config_json(path: str) -> bool:
+    return os.path.isfile(os.path.join(path, "config.json"))
+
+
+def _find_model_on_volume(volume_root: str, hint: str) -> str | None:
     """
-    Build the environment for the vLLM child process.
+    Search `volume_root` for a directory that contains config.json.
 
-    Volume / model source priority
-    ────────────────────────────────────────────────────────────────────────────
-    Set ONE of these env vars in your RunPod endpoint:
-
-    MODEL_PATH   – absolute path to a model directory already on the volume.
-                   e.g.  /runpod-volume/models/Qwen3.5-27B
-                   vLLM will load weights directly from this path; no download.
-
-    HF_HOME      – path to a HuggingFace cache directory on the volume.
-                   e.g.  /runpod-volume/hf-cache
-                   vLLM will resolve  model: Qwen/Qwen3.5-27B  from this cache.
-
-    If neither is set the container falls back to the default HF cache
-    (~/.cache/huggingface) and downloads the model on cold start.
-    ────────────────────────────────────────────────────────────────────────────
+    Search order:
+      1. Direct match:           <volume_root>/<hint>
+      2. Nested models folder:   <volume_root>/models/<hint>
+      3. HF snapshot cache:      <volume_root>/hub/models--<org>--<name>/snapshots/<hash>/
+      4. Any immediate child of  <volume_root>  that has a config.json
     """
-    env = os.environ.copy()
+    # Normalise hint  "Qwen/Qwen3.5-27B"  →  "Qwen3.5-27B"
+    short_name = hint.split("/")[-1] if "/" in hint else hint
 
-    hf_home    = os.environ.get("HF_HOME")
-    model_path = os.environ.get("MODEL_PATH")
+    candidates = [
+        os.path.join(volume_root, hint),
+        os.path.join(volume_root, short_name),
+        os.path.join(volume_root, "models", hint),
+        os.path.join(volume_root, "models", short_name),
+    ]
 
-    if model_path:
-        if not os.path.isdir(model_path):
-            log.warn(f"MODEL_PATH={model_path!r} does not exist or is not a directory.")
-        else:
-            log.info(f"Model source: local volume path  →  {model_path}")
-    elif hf_home:
-        log.info(f"Model source: HuggingFace cache on volume  →  HF_HOME={hf_home}")
-        env["HF_HOME"] = hf_home
-        # Keep HF_DATASETS_CACHE inside the same volume root to avoid stray downloads
-        env.setdefault("HF_DATASETS_CACHE", os.path.join(hf_home, "datasets"))
-    else:
+    # HuggingFace snapshot cache layout:
+    #   <volume_root>/hub/models--Qwen--Qwen3.5-27B/snapshots/<hash>/
+    if "/" in hint:
+        org, name = hint.split("/", 1)
+        hf_model_dir = os.path.join(volume_root, "hub", f"models--{org}--{name}", "snapshots")
+        if os.path.isdir(hf_model_dir):
+            for snap in sorted(os.listdir(hf_model_dir)):
+                candidates.append(os.path.join(hf_model_dir, snap))
+
+    for path in candidates:
+        if _has_config_json(path):
+            return path
+
+    # Last resort: any immediate child with config.json
+    if os.path.isdir(volume_root):
+        for child in sorted(os.listdir(volume_root)):
+            child_path = os.path.join(volume_root, child)
+            if os.path.isdir(child_path) and _has_config_json(child_path):
+                return child_path
+
+    return None
+
+
+def _log_volume_tree(volume_root: str, depth: int = 2) -> None:
+    """Log the directory tree of the volume so the correct path is visible in logs."""
+    if not os.path.isdir(volume_root):
+        log.info(f"  (volume root {volume_root!r} does not exist)")
+        return
+    for root, dirs, files in os.walk(volume_root):
+        level = root.replace(volume_root, "").count(os.sep)
+        if level >= depth:
+            dirs.clear()
+            continue
+        indent = "  " * level
+        log.info(f"  {indent}{os.path.basename(root)}/")
+        if level == depth - 1:
+            for f in files[:6]:
+                log.info(f"  {indent}  {f}")
+            if len(files) > 6:
+                log.info(f"  {indent}  … ({len(files) - 6} more files)")
+
+
+def resolve_model_path() -> str | None:
+    """
+    Return the final model path to pass to vLLM, or None to let config.yaml decide.
+
+    Priority:
+      1. MODEL_PATH env var — must point directly at a dir with config.json.
+      2. Auto-discover on VOLUME_PATH (default /runpod-volume) using the model
+         name from MODEL_NAME env var or config.yaml.
+      3. HF_HOME env var — handled separately via env; no path override needed.
+    """
+    import yaml
+
+    volume_root = os.environ.get("VOLUME_PATH", "/runpod-volume")
+
+    # 1. Explicit path
+    explicit = os.environ.get("MODEL_PATH", "").strip()
+    if explicit:
+        if _has_config_json(explicit):
+            log.info(f"Model source: MODEL_PATH  →  {explicit}")
+            return explicit
+        # Path given but wrong — search inside it as a volume root too
         log.warn(
-            "Neither MODEL_PATH nor HF_HOME is set. "
-            "Model will be downloaded from HuggingFace on every cold start. "
-            "Set MODEL_PATH or HF_HOME to point at your RunPod network volume."
+            f"MODEL_PATH={explicit!r} has no config.json. "
+            f"Scanning it and {volume_root!r} for the model …"
         )
+        log.info(f"Contents of {explicit}:")
+        _log_volume_tree(explicit, depth=3)
 
+    # Read model name from env or config.yaml
+    try:
+        with open(CONFIG_PATH) as f:
+            config = yaml.safe_load(f) or {}
+        model_hint = os.environ.get("MODEL_NAME") or config.get("model", "")
+    except Exception:
+        model_hint = os.environ.get("MODEL_NAME", "")
+
+    # 2. Auto-discover on the volume
+    if os.path.isdir(volume_root):
+        log.info(f"Scanning volume {volume_root!r} for model {model_hint!r} …")
+        _log_volume_tree(volume_root, depth=2)
+
+        found = _find_model_on_volume(volume_root, model_hint)
+        if found:
+            log.info(f"Model source: auto-discovered on volume  →  {found}")
+            return found
+
+        log.warn(
+            f"Could not find a directory with config.json on {volume_root!r}. "
+            f"Set MODEL_PATH=<exact path> or HF_HOME=<hf-cache path> in your RunPod env vars."
+        )
+    else:
+        log.warn(f"Volume root {volume_root!r} is not mounted. Falling back to HuggingFace download.")
+
+    return None  # fall back to config.yaml model (HF download)
+
+
+def build_vllm_env() -> dict:
+    """Forward HF_HOME to the vLLM subprocess if set."""
+    env = os.environ.copy()
+    hf_home = os.environ.get("HF_HOME", "").strip()
+    if hf_home:
+        env["HF_HOME"] = hf_home
+        env.setdefault("HF_DATASETS_CACHE", os.path.join(hf_home, "datasets"))
+        log.info(f"HF_HOME  →  {hf_home}")
     return env
 
 
@@ -129,11 +217,11 @@ def start_vllm_server() -> subprocess.Popen:
     """
     Launch vLLM's OpenAI-compatible HTTP server as a child process.
     - tensor-parallel-size is clamped to available GPUs automatically.
-    - If MODEL_PATH is set it overrides the 'model:' value in config.yaml.
-    - HF_HOME is forwarded so vLLM resolves weights from the network volume.
+    - Model path is resolved from volume; falls back to HF download.
     """
-    tp  = resolve_tensor_parallel_size()
-    env = build_vllm_env()
+    tp         = resolve_tensor_parallel_size()
+    env        = build_vllm_env()
+    model_path = resolve_model_path()
 
     cmd = [
         sys.executable, "-m", "vllm.entrypoints.openai.api_server",
@@ -141,13 +229,11 @@ def start_vllm_server() -> subprocess.Popen:
         "--tensor-parallel-size", str(tp),
     ]
 
-    # Local volume path overrides the HuggingFace model ID in config.yaml
-    model_path = os.environ.get("MODEL_PATH")
     if model_path:
         cmd += ["--model", model_path]
 
     log.info(f"Available GPUs: {available_gpus()} | tensor-parallel-size: {tp}")
-    log.info(f"Starting vLLM server: {' '.join(cmd)}")
+    log.info(f"vLLM command: {' '.join(cmd)}")
     return subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr, env=env)
 
 
