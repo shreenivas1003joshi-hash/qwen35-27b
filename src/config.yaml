@@ -1,4 +1,7 @@
-model:  Qwen/Qwen3.5-27B
+# Model source (overridable at runtime via RunPod env vars):
+#   MODEL_PATH=/runpod-volume/models/Qwen3.5-27B   → load weights directly from volume
+#   HF_HOME=/runpod-volume/hf-cache                → resolve this HF ID from volume cache
+model: Qwen/Qwen3.5-27B
 host: "0.0.0.0"
 port: 8001
 tensor-parallel-size: 1      

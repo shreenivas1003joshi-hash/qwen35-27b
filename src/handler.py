@@ -80,22 +80,75 @@ def resolve_tensor_parallel_size() -> int:
     return requested
 
 
+def build_vllm_env() -> dict:
+    """
+    Build the environment for the vLLM child process.
+
+    Volume / model source priority
+    ────────────────────────────────────────────────────────────────────────────
+    Set ONE of these env vars in your RunPod endpoint:
+
+    MODEL_PATH   – absolute path to a model directory already on the volume.
+                   e.g.  /runpod-volume/models/Qwen3.5-27B
+                   vLLM will load weights directly from this path; no download.
+
+    HF_HOME      – path to a HuggingFace cache directory on the volume.
+                   e.g.  /runpod-volume/hf-cache
+                   vLLM will resolve  model: Qwen/Qwen3.5-27B  from this cache.
+
+    If neither is set the container falls back to the default HF cache
+    (~/.cache/huggingface) and downloads the model on cold start.
+    ────────────────────────────────────────────────────────────────────────────
+    """
+    env = os.environ.copy()
+
+    hf_home    = os.environ.get("HF_HOME")
+    model_path = os.environ.get("MODEL_PATH")
+
+    if model_path:
+        if not os.path.isdir(model_path):
+            log.warn(f"MODEL_PATH={model_path!r} does not exist or is not a directory.")
+        else:
+            log.info(f"Model source: local volume path  →  {model_path}")
+    elif hf_home:
+        log.info(f"Model source: HuggingFace cache on volume  →  HF_HOME={hf_home}")
+        env["HF_HOME"] = hf_home
+        # Keep HF_DATASETS_CACHE inside the same volume root to avoid stray downloads
+        env.setdefault("HF_DATASETS_CACHE", os.path.join(hf_home, "datasets"))
+    else:
+        log.warn(
+            "Neither MODEL_PATH nor HF_HOME is set. "
+            "Model will be downloaded from HuggingFace on every cold start. "
+            "Set MODEL_PATH or HF_HOME to point at your RunPod network volume."
+        )
+
+    return env
+
+
 def start_vllm_server() -> subprocess.Popen:
     """
     Launch vLLM's OpenAI-compatible HTTP server as a child process.
-    --tensor-parallel-size is resolved at runtime so the same image works
-    on 1-GPU, 2-GPU, or 4-GPU RunPod workers without changing config.yaml.
-    All server stdout/stderr is forwarded so RunPod captures the logs.
+    - tensor-parallel-size is clamped to available GPUs automatically.
+    - If MODEL_PATH is set it overrides the 'model:' value in config.yaml.
+    - HF_HOME is forwarded so vLLM resolves weights from the network volume.
     """
-    tp = resolve_tensor_parallel_size()
+    tp  = resolve_tensor_parallel_size()
+    env = build_vllm_env()
+
     cmd = [
         sys.executable, "-m", "vllm.entrypoints.openai.api_server",
         "--config", CONFIG_PATH,
         "--tensor-parallel-size", str(tp),
     ]
+
+    # Local volume path overrides the HuggingFace model ID in config.yaml
+    model_path = os.environ.get("MODEL_PATH")
+    if model_path:
+        cmd += ["--model", model_path]
+
     log.info(f"Available GPUs: {available_gpus()} | tensor-parallel-size: {tp}")
     log.info(f"Starting vLLM server: {' '.join(cmd)}")
-    return subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr)
+    return subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr, env=env)
 
 
 async def wait_for_vllm(proc: subprocess.Popen, timeout: int = READY_TIMEOUT) -> None:
