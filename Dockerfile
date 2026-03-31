@@ -17,5 +17,7 @@ ENV VLLM_LOGGING_LEVEL=INFO
 # Override the vLLM image's default entrypoint.
 # handler.py starts the vLLM server internally and waits for it to be
 # fully loaded before RunPod accepts any jobs.
-ENTRYPOINT []
-CMD ["python", "-u", "/app/src/handler.py"]
+# Use shell form so the shell resolves python3 from PATH correctly,
+# the same way the vLLM base image does internally.
+ENTRYPOINT ["/bin/bash", "-c"]
+CMD ["python3 -u /app/src/handler.py"]
