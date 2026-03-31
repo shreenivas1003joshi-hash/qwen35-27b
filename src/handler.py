@@ -35,16 +35,65 @@ READY_TIMEOUT = int(os.environ.get("VLLM_READY_TIMEOUT", 900))  # seconds
 # Startup helpers
 # ---------------------------------------------------------------------------
 
+def available_gpus() -> int:
+    """Return the number of CUDA GPUs visible to this process."""
+    try:
+        import torch
+        n = torch.cuda.device_count()
+        return n if n > 0 else 1
+    except Exception:
+        return 1
+
+
+def resolve_tensor_parallel_size() -> int:
+    """
+    Determine the tensor-parallel-size to pass to vLLM:
+      1. TENSOR_PARALLEL_SIZE env var (highest priority — set in RunPod endpoint config)
+      2. Value from config.yaml
+      3. Falls back to the number of available GPUs
+
+    If the requested size exceeds available GPUs it is clamped automatically
+    so the worker never crashes with a 'World size > available GPUs' error.
+    """
+    import yaml
+
+    # 1. Explicit env override
+    if os.environ.get("TENSOR_PARALLEL_SIZE"):
+        requested = int(os.environ["TENSOR_PARALLEL_SIZE"])
+    else:
+        # 2. Read from config.yaml
+        try:
+            with open(CONFIG_PATH) as f:
+                config = yaml.safe_load(f) or {}
+            requested = int(config.get("tensor-parallel-size", 1))
+        except Exception:
+            requested = 1
+
+    gpus = available_gpus()
+    if requested > gpus:
+        log.warn(
+            f"tensor-parallel-size={requested} exceeds available GPUs ({gpus}). "
+            f"Clamping to {gpus}."
+        )
+        return gpus
+
+    return requested
+
+
 def start_vllm_server() -> subprocess.Popen:
     """
     Launch vLLM's OpenAI-compatible HTTP server as a child process.
-    All server stdout/stderr is forwarded to this process's streams so RunPod
-    captures the logs.
+    --tensor-parallel-size is resolved at runtime so the same image works
+    on 1-GPU, 2-GPU, or 4-GPU RunPod workers without changing config.yaml.
+    All server stdout/stderr is forwarded so RunPod captures the logs.
     """
+    tp = resolve_tensor_parallel_size()
     cmd = [
         sys.executable, "-m", "vllm.entrypoints.openai.api_server",
         "--config", CONFIG_PATH,
+        "--tensor-parallel-size", str(tp),
     ]
+    log.info(f"Available GPUs: {available_gpus()} | tensor-parallel-size: {tp}")
     log.info(f"Starting vLLM server: {' '.join(cmd)}")
     return subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr)
 
