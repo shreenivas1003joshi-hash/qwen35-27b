@@ -84,61 +84,106 @@ def _has_config_json(path: str) -> bool:
     return os.path.isfile(os.path.join(path, "config.json"))
 
 
-def validate_model_dir(path: str) -> None:
-    """
-    Verify the model directory is complete enough for vLLM to load.
-    Raises SystemExit with a human-readable message on failure so the
-    worker exits cleanly instead of crashing deep inside the EngineCore.
+def _read_model_config(path: str) -> dict:
+    try:
+        with open(os.path.join(path, "config.json")) as f:
+            import json
+            return json.load(f)
+    except Exception:
+        return {}
 
-    Checks:
+
+def validate_model_dir(path: str, expected_model_id: str | None = None) -> None:
+    """
+    Validate the model directory before handing it to vLLM.
+
+    Checks (in order):
       1. config.json is present.
-      2. At least one weight shard (.safetensors / .bin) is present.
-      3. No weight file resolves to a zero-byte or missing blob
-         (catches partial downloads caused by disk-quota errors).
+      2. The model_type / architectures in config.json are logged so mismatches
+         are immediately visible — catches 'wrong model in the volume' errors
+         before the EngineCore crashes with an opaque weights mismatch.
+      3. At least one weight shard (.safetensors / .bin) is present.
+      4. No shard resolves to a zero-byte or broken-symlink blob (partial DL).
+      5. Total size is sanity-checked: warns if < 1 GB (suspiciously small).
     """
     WEIGHT_EXTS = (".safetensors", ".bin", ".pt")
 
     if not _has_config_json(path):
-        log.error(f"Model directory {path!r} has no config.json. The path is wrong.")
+        log.error(f"Model directory {path!r} has no config.json — path is wrong.")
         sys.exit(1)
 
-    entries = os.listdir(path)
+    # ── Read and log the model identity from config.json ──────────────────
+    cfg = _read_model_config(path)
+    model_type    = cfg.get("model_type", "unknown")
+    architectures = cfg.get("architectures", [])
+    hf_name       = cfg.get("_name_or_path", cfg.get("name_or_path", ""))
+    num_layers    = cfg.get("num_hidden_layers", cfg.get("num_layers", "?"))
+
+    log.info(
+        f"config.json  →  model_type={model_type!r}  "
+        f"architectures={architectures}  "
+        f"layers={num_layers}  "
+        f"name_or_path={hf_name!r}"
+    )
+
+    if expected_model_id and hf_name and expected_model_id.lower() not in hf_name.lower():
+        log.error(
+            f"WRONG MODEL IN VOLUME.\n"
+            f"  Expected : {expected_model_id}\n"
+            f"  Found    : {hf_name}  (model_type={model_type!r})\n"
+            f"  Path     : {path}\n"
+            f"The volume contains a different model. "
+            f"Update MODEL_PATH / HF_HOME to point at {expected_model_id}, "
+            f"or update 'model:' in config.yaml to match what is in the volume."
+        )
+        sys.exit(1)
+
+    # ── Check weight files ─────────────────────────────────────────────────
+    entries      = os.listdir(path)
     weight_files = [f for f in entries if any(f.endswith(e) for e in WEIGHT_EXTS)]
 
     if not weight_files:
         log.error(
-            f"No weight files (.safetensors/.bin) found in {path!r}. "
-            f"The model may not have been downloaded yet."
+            f"No weight files (.safetensors / .bin) found in {path!r}. "
+            f"The model may not have been downloaded."
         )
         sys.exit(1)
 
     bad = []
-    for fname in weight_files:
+    total_bytes = 0
+    for fname in sorted(weight_files):
         fpath = os.path.join(path, fname)
-        # HF cache uses symlinks; resolve to the actual blob
-        real = os.path.realpath(fpath)
+        real  = os.path.realpath(fpath)          # resolve HF-cache symlinks
         if not os.path.exists(real):
-            bad.append(f"{fname} → broken symlink ({real})")
-        elif os.path.getsize(real) == 0:
-            bad.append(f"{fname} → 0 bytes")
+            bad.append(f"  {fname} → broken symlink ({real})")
+        else:
+            size = os.path.getsize(real)
+            if size == 0:
+                bad.append(f"  {fname} → 0 bytes (download was cut short)")
+            else:
+                total_bytes += size
 
     if bad:
         log.error(
-            f"Incomplete model download detected in {path!r}. "
-            f"The previous download was interrupted (disk quota exceeded?). "
-            f"Delete the partial files and re-download the model.\n"
-            f"Affected files:\n  " + "\n  ".join(bad)
+            f"Incomplete download detected in {path!r}.\n"
+            f"Affected files:\n" + "\n".join(bad) + "\n"
+            f"Fix: delete the partial files and re-download to a volume with "
+            f"enough free space."
         )
         sys.exit(1)
 
-    total_gb = sum(
-        os.path.getsize(os.path.realpath(os.path.join(path, f)))
-        for f in weight_files
-        if os.path.exists(os.path.realpath(os.path.join(path, f)))
-    ) / (1024 ** 3)
+    total_gb = total_bytes / (1024 ** 3)
+    if total_gb < 1.0:
+        log.warn(
+            f"Total weight size is only {total_gb:.2f} GB across "
+            f"{len(weight_files)} file(s) — this is suspiciously small for "
+            f"a model named {hf_name!r}. "
+            f"The volume may contain the wrong model."
+        )
+
     log.info(
-        f"Model validation OK: {len(weight_files)} weight files, "
-        f"{total_gb:.1f} GB total  →  {path}"
+        f"Model validation OK — {len(weight_files)} shards, "
+        f"{total_gb:.1f} GB  →  {path}"
     )
 
 
@@ -317,9 +362,18 @@ def start_vllm_server() -> subprocess.Popen:
     model_path = resolve_model_path()
     env        = build_vllm_env(model_path)
 
-    # Validate before handing off to vLLM — catches incomplete downloads early
+    # Validate before handing off to vLLM.
+    # Passes the expected model ID so a wrong-model-in-volume mismatch is
+    # caught here with a clear message instead of inside the EngineCore.
     if model_path:
-        validate_model_dir(model_path)
+        import yaml
+        try:
+            with open(CONFIG_PATH) as f:
+                _cfg = yaml.safe_load(f) or {}
+            expected_id = os.environ.get("MODEL_NAME") or _cfg.get("model")
+        except Exception:
+            expected_id = os.environ.get("MODEL_NAME")
+        validate_model_dir(model_path, expected_model_id=expected_id)
 
     cmd = [
         sys.executable, "-m", "vllm.entrypoints.openai.api_server",
