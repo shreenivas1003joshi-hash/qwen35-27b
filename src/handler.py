@@ -84,6 +84,64 @@ def _has_config_json(path: str) -> bool:
     return os.path.isfile(os.path.join(path, "config.json"))
 
 
+def validate_model_dir(path: str) -> None:
+    """
+    Verify the model directory is complete enough for vLLM to load.
+    Raises SystemExit with a human-readable message on failure so the
+    worker exits cleanly instead of crashing deep inside the EngineCore.
+
+    Checks:
+      1. config.json is present.
+      2. At least one weight shard (.safetensors / .bin) is present.
+      3. No weight file resolves to a zero-byte or missing blob
+         (catches partial downloads caused by disk-quota errors).
+    """
+    WEIGHT_EXTS = (".safetensors", ".bin", ".pt")
+
+    if not _has_config_json(path):
+        log.error(f"Model directory {path!r} has no config.json. The path is wrong.")
+        sys.exit(1)
+
+    entries = os.listdir(path)
+    weight_files = [f for f in entries if any(f.endswith(e) for e in WEIGHT_EXTS)]
+
+    if not weight_files:
+        log.error(
+            f"No weight files (.safetensors/.bin) found in {path!r}. "
+            f"The model may not have been downloaded yet."
+        )
+        sys.exit(1)
+
+    bad = []
+    for fname in weight_files:
+        fpath = os.path.join(path, fname)
+        # HF cache uses symlinks; resolve to the actual blob
+        real = os.path.realpath(fpath)
+        if not os.path.exists(real):
+            bad.append(f"{fname} → broken symlink ({real})")
+        elif os.path.getsize(real) == 0:
+            bad.append(f"{fname} → 0 bytes")
+
+    if bad:
+        log.error(
+            f"Incomplete model download detected in {path!r}. "
+            f"The previous download was interrupted (disk quota exceeded?). "
+            f"Delete the partial files and re-download the model.\n"
+            f"Affected files:\n  " + "\n  ".join(bad)
+        )
+        sys.exit(1)
+
+    total_gb = sum(
+        os.path.getsize(os.path.realpath(os.path.join(path, f)))
+        for f in weight_files
+        if os.path.exists(os.path.realpath(os.path.join(path, f)))
+    ) / (1024 ** 3)
+    log.info(
+        f"Model validation OK: {len(weight_files)} weight files, "
+        f"{total_gb:.1f} GB total  →  {path}"
+    )
+
+
 def _resolve_hf_snapshot(hf_home: str, model_id: str) -> str | None:
     """
     Given an HF_HOME directory and a model ID like "Qwen/Qwen3.5-27B",
@@ -252,10 +310,16 @@ def start_vllm_server() -> subprocess.Popen:
     Launch vLLM's OpenAI-compatible HTTP server as a child process.
     - tensor-parallel-size is clamped to available GPUs automatically.
     - Model path resolved to exact local snapshot; HF network disabled when local.
+    - Model directory is validated before vLLM starts so broken downloads
+      produce a clear error instead of a cryptic EngineCore crash.
     """
     tp         = resolve_tensor_parallel_size()
     model_path = resolve_model_path()
     env        = build_vllm_env(model_path)
+
+    # Validate before handing off to vLLM — catches incomplete downloads early
+    if model_path:
+        validate_model_dir(model_path)
 
     cmd = [
         sys.executable, "-m", "vllm.entrypoints.openai.api_server",
