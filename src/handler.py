@@ -700,17 +700,17 @@ async def wait_for_vllm(proc: subprocess.Popen, timeout: int = READY_TIMEOUT) ->
     """
     Block until vLLM is truly ready to serve inference — not just HTTP-up.
 
-    vLLM's /health endpoint returns 200 as soon as the HTTP server starts,
-    but the model loads asynchronously in the background.  A worker that signals
-    RunPod "ready" at this point will receive jobs before the model is in VRAM,
-    making the first request pay the full load penalty.
+    vLLM's /health returns 200 as soon as the HTTP server starts, long before
+    model weights are in VRAM.  /v1/models returns the model entry as soon as
+    it is *configured*, not when weights are loaded.  The only reliable signal
+    is a successful inference response.
 
-    Sequence:
-      1. Poll /health until the HTTP server is alive.
-      2. Poll /v1/models until the model appears in the registry.
-      3. Send a single warmup inference (max_tokens=1) and wait for it to return.
-         This forces CUDA graphs and any remaining JIT compilation to complete
-         so that the very first real request gets full-speed latency.
+    Sequence (all phases share the same deadline):
+      1. Poll /health  — wait for the HTTP server to start.
+      2. Poll /v1/models — wait for the model to be configured.
+      3. Warmup inference — send max_tokens=1 and wait for a 200 response.
+         This blocks until weights are in VRAM and CUDA graphs are compiled,
+         guaranteeing zero load latency on the first real request.
     """
     import aiohttp
 
@@ -718,11 +718,14 @@ async def wait_for_vllm(proc: subprocess.Popen, timeout: int = READY_TIMEOUT) ->
     loop     = asyncio.get_event_loop()
     deadline = loop.time() + timeout
 
-    # ── Step 1: HTTP server alive ─────────────────────────────────────────────
-    while loop.time() < deadline:
+    def _check_proc() -> None:
         if proc.poll() is not None:
             log.error(f"vLLM process exited early with code {proc.returncode}.")
             sys.exit(1)
+
+    # ── Phase 1: HTTP server alive ────────────────────────────────────────────
+    while loop.time() < deadline:
+        _check_proc()
         try:
             async with aiohttp.ClientSession() as s:
                 async with s.get(
@@ -730,21 +733,20 @@ async def wait_for_vllm(proc: subprocess.Popen, timeout: int = READY_TIMEOUT) ->
                     timeout=aiohttp.ClientTimeout(total=3),
                 ) as r:
                     if r.status == 200:
-                        log.info("vLLM HTTP server is up — waiting for model …")
+                        log.info("vLLM HTTP server is up — waiting for model weights …")
                         break
         except Exception:
             pass
         await asyncio.sleep(2)
     else:
-        log.error(f"vLLM HTTP server did not start within {timeout}s. Exiting.")
+        log.error(f"vLLM HTTP server did not start within {timeout}s.")
         proc.kill()
         sys.exit(1)
 
-    # ── Step 2: Model registered ──────────────────────────────────────────────
+    # ── Phase 2: Model entry registered ──────────────────────────────────────
+    # (This passes quickly — it only confirms the model is configured, not loaded.)
     while loop.time() < deadline:
-        if proc.poll() is not None:
-            log.error(f"vLLM process exited early with code {proc.returncode}.")
-            sys.exit(1)
+        _check_proc()
         try:
             async with aiohttp.ClientSession() as s:
                 async with s.get(
@@ -754,51 +756,59 @@ async def wait_for_vllm(proc: subprocess.Popen, timeout: int = READY_TIMEOUT) ->
                     if r.status == 200:
                         data = await r.json()
                         if data.get("data"):
-                            log.info(
-                                f"Model registered: "
-                                f"{[m['id'] for m in data['data']]}"
-                            )
+                            ids = [m["id"] for m in data["data"]]
+                            log.info(f"Model entry registered: {ids}")
                             break
         except Exception:
             pass
         await asyncio.sleep(3)
     else:
-        log.error(f"vLLM model did not register within {timeout}s. Exiting.")
+        log.error(f"vLLM model did not register within {timeout}s.")
         proc.kill()
         sys.exit(1)
 
-    # ── Step 3: Warmup inference ──────────────────────────────────────────────
-    # Sends a minimal request so CUDA graphs are fully captured and any
-    # remaining torch.compile work is done before the first real job arrives.
-    log.info("Running warmup inference (max_tokens=1) …")
+    # ── Phase 3: Warmup inference ─────────────────────────────────────────────
+    # This is the ONLY reliable signal that weights are in VRAM and CUDA graphs
+    # are compiled.  We keep retrying until deadline (not a separate 120s cap)
+    # so large models that take 200-300s to load don't time out prematurely.
+    log.info("Sending warmup inference request (this blocks until model is in VRAM) …")
     warmup_body = {
         "model":      _SERVED_MODEL_NAME or "default",
         "messages":   [{"role": "user", "content": "Hi"}],
         "max_tokens": 1,
         "stream":     False,
     }
-    warmup_deadline = loop.time() + 120  # warmup should never take >2 min
-    while loop.time() < warmup_deadline:
-        if proc.poll() is not None:
-            log.error(f"vLLM process exited during warmup (code {proc.returncode}).")
-            sys.exit(1)
+    warmup_logged = False
+    while loop.time() < deadline:
+        _check_proc()
+        remaining = int(deadline - loop.time())
         try:
             async with aiohttp.ClientSession() as s:
                 async with s.post(
                     f"{VLLM_URL}/v1/chat/completions",
                     json=warmup_body,
-                    timeout=aiohttp.ClientTimeout(total=60),
+                    # Give each single attempt up to the full remaining time so
+                    # the request isn't cancelled mid-flight while weights load.
+                    timeout=aiohttp.ClientTimeout(total=max(remaining, 10)),
                 ) as r:
                     if r.status == 200:
-                        log.info("Warmup complete — worker is fully ready.")
+                        log.info("Warmup complete — model is in VRAM, worker is ready.")
                         return
                     text = await r.text()
-                    log.warn(f"Warmup got HTTP {r.status}: {text[:200]}")
+                    if not warmup_logged:
+                        log.info(
+                            f"Warmup queued (HTTP {r.status}) — "
+                            f"model still loading, {remaining}s remaining …"
+                        )
+                        warmup_logged = True
+        except asyncio.TimeoutError:
+            log.info(f"Warmup still waiting for model ({remaining}s remaining) …")
+            warmup_logged = False  # reset so next loop logs again
         except Exception as exc:
-            log.warn(f"Warmup attempt failed ({exc}), retrying …")
-        await asyncio.sleep(3)
+            log.warn(f"Warmup request error: {exc}")
+        await asyncio.sleep(5)
 
-    log.error("Warmup inference did not complete within 120s. Exiting.")
+    log.error(f"Model did not become ready within {timeout}s.")
     proc.kill()
     sys.exit(1)
 
