@@ -30,6 +30,10 @@ VLLM_PORT   = int(os.environ.get("VLLM_PORT", 8001))
 VLLM_URL    = f"http://localhost:{VLLM_PORT}"
 READY_TIMEOUT = int(os.environ.get("VLLM_READY_TIMEOUT", 900))  # seconds
 
+# Set at startup once vLLM is launched; the handler rewrites the "model" field
+# in every request to this value so the name always matches what vLLM registered.
+_SERVED_MODEL_NAME: str = ""
+
 
 # ---------------------------------------------------------------------------
 # Custom exceptions
@@ -663,51 +667,138 @@ def start_vllm_server() -> subprocess.Popen:
             expected_id = os.environ.get("MODEL_NAME")
         validate_model_dir(model_path, expected_model_id=expected_id)
 
+    # The human-readable model name used in API requests (the "model" field).
+    # When vLLM is given a local path via --model, it registers under that path.
+    # --served-model-name gives it a clean HuggingFace-style name instead so
+    # client requests with e.g. "model": "Qwen/Qwen3.5-27B" work correctly.
+    served_model_name = (
+        os.environ.get("MODEL_NAME")
+        or (expected_id if model_path else None)
+        or "default"
+    )
+
     cmd = [
         sys.executable, "-m", "vllm.entrypoints.openai.api_server",
         "--config", CONFIG_PATH,
         "--tensor-parallel-size", str(tp),
+        "--served-model-name", served_model_name,
     ]
 
     if model_path:
         cmd += ["--model", model_path]
 
+    global _SERVED_MODEL_NAME
+    _SERVED_MODEL_NAME = served_model_name
+
     log.info(f"Available GPUs: {available_gpus()} | tensor-parallel-size: {tp}")
+    log.info(f"Served model name: {served_model_name}")
     log.info(f"vLLM command: {' '.join(cmd)}")
     return subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr, env=env)
 
 
 async def wait_for_vllm(proc: subprocess.Popen, timeout: int = READY_TIMEOUT) -> None:
     """
-    Poll GET /health until vLLM responds 200 (model fully loaded + warmed up).
-    Exits the process if vLLM crashes before becoming ready.
+    Block until vLLM is truly ready to serve inference — not just HTTP-up.
+
+    vLLM's /health endpoint returns 200 as soon as the HTTP server starts,
+    but the model loads asynchronously in the background.  A worker that signals
+    RunPod "ready" at this point will receive jobs before the model is in VRAM,
+    making the first request pay the full load penalty.
+
+    Sequence:
+      1. Poll /health until the HTTP server is alive.
+      2. Poll /v1/models until the model appears in the registry.
+      3. Send a single warmup inference (max_tokens=1) and wait for it to return.
+         This forces CUDA graphs and any remaining JIT compilation to complete
+         so that the very first real request gets full-speed latency.
     """
     import aiohttp
 
     log.info(f"Waiting for vLLM to be ready (timeout={timeout}s) …")
-    deadline = asyncio.get_event_loop().time() + timeout
+    loop     = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
 
-    while asyncio.get_event_loop().time() < deadline:
-        # Check if vLLM process died unexpectedly
+    # ── Step 1: HTTP server alive ─────────────────────────────────────────────
+    while loop.time() < deadline:
         if proc.poll() is not None:
             log.error(f"vLLM process exited early with code {proc.returncode}.")
             sys.exit(1)
-
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
                     f"{VLLM_URL}/health",
                     timeout=aiohttp.ClientTimeout(total=3),
-                ) as resp:
-                    if resp.status == 200:
-                        log.info("vLLM is ready — worker accepting jobs.")
-                        return
+                ) as r:
+                    if r.status == 200:
+                        log.info("vLLM HTTP server is up — waiting for model …")
+                        break
         except Exception:
-            pass  # Server not up yet, keep polling
-
+            pass
         await asyncio.sleep(2)
+    else:
+        log.error(f"vLLM HTTP server did not start within {timeout}s. Exiting.")
+        proc.kill()
+        sys.exit(1)
 
-    log.error(f"vLLM did not become ready within {timeout}s. Exiting.")
+    # ── Step 2: Model registered ──────────────────────────────────────────────
+    while loop.time() < deadline:
+        if proc.poll() is not None:
+            log.error(f"vLLM process exited early with code {proc.returncode}.")
+            sys.exit(1)
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    f"{VLLM_URL}/v1/models",
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        if data.get("data"):
+                            log.info(
+                                f"Model registered: "
+                                f"{[m['id'] for m in data['data']]}"
+                            )
+                            break
+        except Exception:
+            pass
+        await asyncio.sleep(3)
+    else:
+        log.error(f"vLLM model did not register within {timeout}s. Exiting.")
+        proc.kill()
+        sys.exit(1)
+
+    # ── Step 3: Warmup inference ──────────────────────────────────────────────
+    # Sends a minimal request so CUDA graphs are fully captured and any
+    # remaining torch.compile work is done before the first real job arrives.
+    log.info("Running warmup inference (max_tokens=1) …")
+    warmup_body = {
+        "model":      _SERVED_MODEL_NAME or "default",
+        "messages":   [{"role": "user", "content": "Hi"}],
+        "max_tokens": 1,
+        "stream":     False,
+    }
+    warmup_deadline = loop.time() + 120  # warmup should never take >2 min
+    while loop.time() < warmup_deadline:
+        if proc.poll() is not None:
+            log.error(f"vLLM process exited during warmup (code {proc.returncode}).")
+            sys.exit(1)
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.post(
+                    f"{VLLM_URL}/v1/chat/completions",
+                    json=warmup_body,
+                    timeout=aiohttp.ClientTimeout(total=60),
+                ) as r:
+                    if r.status == 200:
+                        log.info("Warmup complete — worker is fully ready.")
+                        return
+                    text = await r.text()
+                    log.warn(f"Warmup got HTTP {r.status}: {text[:200]}")
+        except Exception as exc:
+            log.warn(f"Warmup attempt failed ({exc}), retrying …")
+        await asyncio.sleep(3)
+
+    log.error("Warmup inference did not complete within 120s. Exiting.")
     proc.kill()
     sys.exit(1)
 
@@ -751,6 +842,13 @@ async def handler(job):
 
     job_input = job.get("input", {})
     route, body = resolve_route_and_body(job_input)
+
+    # Always overwrite "model" with the name vLLM is actually serving.
+    # Without this, requests that omit "model" or use the HuggingFace ID get a
+    # 404 when vLLM was loaded from a local path and registered under that path.
+    if _SERVED_MODEL_NAME:
+        body = {**body, "model": _SERVED_MODEL_NAME}
+
     url = f"{VLLM_URL}{route}"
     is_stream = body.get("stream", False)
 
