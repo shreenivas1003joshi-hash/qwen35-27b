@@ -221,7 +221,7 @@ def download_model_to_volume(model_id: str) -> None:
         log.error("huggingface_hub is not installed — cannot auto-download.")
         sys.exit(1)
 
-    hf_home  = os.environ.get("HF_HOME", "/runpod-volume/hf-cache")
+    hf_home  = os.environ.get("HF_HOME", "/runpod-volume/huggingface-cache")
     hub_cache = os.path.join(hf_home, "hub")   # must match HF_HOME convention
     token    = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
 
@@ -536,8 +536,13 @@ def _find_model_on_volume(volume_root: str, hint: str) -> str | None:
         if _has_config_json(path):
             return path
 
-    # HF cache layouts — check both <volume_root> and <volume_root>/hf-cache as hf_home
-    for hf_home in [volume_root, os.path.join(volume_root, "hf-cache")]:
+    # HF cache layouts — check common cache directory names under the volume root
+    for hf_home in [
+        volume_root,
+        os.path.join(volume_root, "huggingface-cache"),
+        os.path.join(volume_root, "hf-cache"),
+        os.path.join(volume_root, "huggingface"),
+    ]:
         snap = _resolve_hf_snapshot(hf_home, hint)
         if snap:
             return snap
@@ -791,7 +796,7 @@ if __name__ == "__main__":
     # ---------------------------------------------------------------------------
     # Pre-flight: ensure the model is fully present on the volume.
     # ---------------------------------------------------------------------------
-    _hf_home    = os.environ.get("HF_HOME", "/runpod-volume/hf-cache")
+    _hf_home    = os.environ.get("HF_HOME", "/runpod-volume/huggingface-cache")
     _vol_root   = os.environ.get("VOLUME_PATH", "/runpod-volume")
 
     # Show what's on the volume so quota surprises are immediately visible in logs
