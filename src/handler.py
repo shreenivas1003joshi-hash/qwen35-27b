@@ -47,14 +47,46 @@ class _IncompleteDownloadError(Exception):
 # Auto-download helper
 # ---------------------------------------------------------------------------
 
+def _check_write_quota(path: str) -> bool:
+    """
+    Return True if we can actually write to *path*.
+
+    statvfs().f_bavail on NFS / RunPod network volumes reports the total pool
+    size, not the per-volume quota — it can show hundreds of TB even when the
+    user's 50 GB quota is exhausted.  Writing a tiny test file is the only
+    reliable way to detect EDQUOT (errno 122) early.
+    """
+    os.makedirs(path, exist_ok=True)
+    test = os.path.join(path, ".quota_check")
+    try:
+        with open(test, "w") as f:
+            f.write("x")
+        os.remove(test)
+        return True
+    except OSError as exc:
+        import errno as _errno
+        if exc.errno == _errno.EDQUOT:
+            log.error(
+                "DISK QUOTA EXCEEDED on the RunPod network volume.\n"
+                "The volume is full (statvfs shows the shared pool size, not your quota).\n"
+                "Fix: RunPod dashboard → Storage → increase the volume size, then redeploy."
+            )
+        else:
+            log.error(f"Cannot write to {path!r}: {exc}")
+        return False
+
+
 def download_model_to_volume(model_id: str) -> None:
     """
     Download (or resume) a HuggingFace model to the network volume.
 
-    Target directory: $HF_HOME  (default /runpod-volume/hf-cache)
-    Only .safetensors weights are fetched; .pt/.bin/original/* are skipped.
-    snapshot_download is idempotent — it skips files that are already present
-    and only fetches what is missing, so re-running after a quota error is safe.
+    cache_dir is set to $HF_HOME/hub/ so the layout matches what vLLM expects
+    when HF_HOME is set as an environment variable:
+        $HF_HOME/hub/models--{org}--{name}/snapshots/{hash}/
+    Passing cache_dir=$HF_HOME (without hub/) would create a *different* path
+    and none of the already-downloaded blobs would be reused.
+
+    snapshot_download is idempotent — files already present are skipped.
     """
     try:
         from huggingface_hub import snapshot_download
@@ -62,34 +94,41 @@ def download_model_to_volume(model_id: str) -> None:
         log.error("huggingface_hub is not installed — cannot auto-download.")
         sys.exit(1)
 
-    hf_home = os.environ.get("HF_HOME", "/runpod-volume/hf-cache")
-    token   = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    hf_home  = os.environ.get("HF_HOME", "/runpod-volume/hf-cache")
+    hub_cache = os.path.join(hf_home, "hub")   # must match HF_HOME convention
+    token    = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
 
-    # Make sure the target directory exists on the volume
-    os.makedirs(hf_home, exist_ok=True)
+    # Verify we can actually write before attempting a multi-GB download
+    if not _check_write_quota(hub_cache):
+        sys.exit(1)
 
-    # Check free space (warn only — the download might still fit)
+    # Report usable space via shutil (more accurate than statvfs on quota filesystems)
     try:
-        st = os.statvfs(hf_home)
-        free_gb = st.f_bavail * st.f_frsize / (1024 ** 3)
-        log.info(f"Volume free space: {free_gb:.1f} GB  (cache dir: {hf_home})")
+        import shutil as _shutil
+        total, used, free = _shutil.disk_usage(hub_cache)
+        free_gb  = free  / (1024 ** 3)
+        total_gb = total / (1024 ** 3)
+        log.info(
+            f"Volume space: {free_gb:.1f} GB free / {total_gb:.1f} GB total  "
+            f"(cache: {hub_cache})"
+        )
         if free_gb < 20:
             log.warn(
-                f"Only {free_gb:.1f} GB free — large models may fail. "
-                f"Free space on the volume before continuing."
+                f"Only {free_gb:.1f} GB free — large models may fail mid-download. "
+                f"Consider increasing the volume size in the RunPod dashboard."
             )
     except Exception:
         pass
 
     log.info(
-        f"Starting snapshot_download for {model_id!r}  →  HF_HOME={hf_home}\n"
-        f"This will only fetch files that are not already present (resume-safe)."
+        f"Starting snapshot_download for {model_id!r}  →  cache_dir={hub_cache}\n"
+        f"Only missing files will be fetched (resume-safe)."
     )
 
     kwargs: dict = dict(
         repo_id         = model_id,
         ignore_patterns = ["*.pt", "*.bin", "original/*"],
-        cache_dir       = hf_home,
+        cache_dir       = hub_cache,
     )
     if token:
         kwargs["token"] = token
@@ -97,6 +136,17 @@ def download_model_to_volume(model_id: str) -> None:
     try:
         local_dir = snapshot_download(**kwargs)
         log.info(f"Download complete → {local_dir}")
+    except OSError as exc:
+        import errno as _errno
+        if exc.errno == _errno.EDQUOT:
+            log.error(
+                "Download failed: disk quota exceeded mid-transfer.\n"
+                "Increase your RunPod volume size and redeploy — "
+                "already-downloaded blobs will be reused automatically."
+            )
+        else:
+            log.error(f"snapshot_download failed: {exc}")
+        sys.exit(1)
     except Exception as exc:
         log.error(f"snapshot_download failed: {exc}")
         sys.exit(1)
