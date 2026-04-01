@@ -47,6 +47,133 @@ class _IncompleteDownloadError(Exception):
 # Auto-download helper
 # ---------------------------------------------------------------------------
 
+def _dir_size_gb(path: str) -> float:
+    """Return the total size of all files under *path* in GB (best-effort)."""
+    total = 0
+    try:
+        for root, _, files in os.walk(path):
+            for f in files:
+                fp = os.path.join(root, f)
+                try:
+                    # Follow symlinks so we count the real blob size
+                    total += os.path.getsize(fp)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total / (1024 ** 3)
+
+
+def _report_volume_usage(volume_root: str) -> None:
+    """Log a top-level disk usage breakdown so the user can see what's taking space."""
+    if not os.path.isdir(volume_root):
+        return
+    log.info(f"── Volume usage breakdown: {volume_root} ──")
+    try:
+        entries = sorted(os.scandir(volume_root), key=lambda e: e.name)
+        for entry in entries:
+            try:
+                gb = _dir_size_gb(entry.path) if entry.is_dir(follow_symlinks=True) else (
+                    entry.stat(follow_symlinks=True).st_size / (1024 ** 3)
+                )
+                log.info(f"  {gb:7.2f} GB  {entry.name}")
+            except OSError:
+                log.info(f"  {'?':>7}      {entry.name}")
+    except OSError as exc:
+        log.warn(f"Could not scan {volume_root}: {exc}")
+    log.info("────────────────────────────────────────────")
+
+
+def _purge_wrong_path_cache(hf_home: str) -> None:
+    """
+    Delete stale cache directories that the old buggy code created at the wrong path.
+
+    When cache_dir=HF_HOME was passed to snapshot_download (instead of HF_HOME/hub/),
+    huggingface_hub wrote blobs to  HF_HOME/models--{name}/blobs/  instead of
+    HF_HOME/hub/models--{name}/blobs/.  After multiple failed retries these accumulate
+    and silently consume tens of GB of quota.
+
+    This function removes every  HF_HOME/models--*/  directory that sits directly
+    under HF_HOME (not under HF_HOME/hub/).
+    """
+    import shutil as _shutil
+    if not os.path.isdir(hf_home):
+        return
+    freed = 0.0
+    try:
+        for entry in os.scandir(hf_home):
+            if entry.is_dir() and entry.name.startswith("models--"):
+                gb = _dir_size_gb(entry.path)
+                log.info(
+                    f"Removing stale wrong-path cache: {entry.path}  ({gb:.2f} GB)"
+                )
+                try:
+                    _shutil.rmtree(entry.path)
+                    freed += gb
+                except Exception as exc:
+                    log.warn(f"Could not remove {entry.path}: {exc}")
+    except OSError as exc:
+        log.warn(f"Could not scan {hf_home} for stale caches: {exc}")
+    if freed > 0:
+        log.info(f"Freed {freed:.2f} GB from wrong-path cache directories.")
+
+
+def _purge_incomplete_snapshot(snapshot_path: str) -> None:
+    """
+    Delete a broken/incomplete HuggingFace snapshot directory and its blobs.
+
+    When a snapshot download is cut short (disk quota), a partial snapshot
+    directory is left behind containing symlinks to blobs.  Those blobs consume
+    real disk space and must be removed before a fresh download will fit.
+
+    We delete:
+      • The snapshot directory itself  (symlinks → freed)
+      • Any blobs referenced ONLY by this snapshot (unreferenced after deletion)
+        i.e. files in  …/blobs/  whose link count drops to 1 (just the blob itself).
+
+    Everything is best-effort; errors are logged but do not abort startup.
+    """
+    import shutil as _shutil
+
+    if not snapshot_path or not os.path.isdir(snapshot_path):
+        return
+
+    log.info(f"Purging incomplete snapshot to free disk space: {snapshot_path}")
+
+    # Collect all blob paths (the real files that symlinks point to)
+    blobs_to_check: list[str] = []
+    try:
+        for entry in os.scandir(snapshot_path):
+            if entry.is_symlink():
+                real = os.path.realpath(entry.path)
+                if os.path.isfile(real):
+                    blobs_to_check.append(real)
+    except Exception as exc:
+        log.warn(f"Could not scan snapshot dir: {exc}")
+
+    # Remove the snapshot directory (this unlinks all symlinks inside)
+    try:
+        _shutil.rmtree(snapshot_path)
+        log.info(f"Removed snapshot dir: {snapshot_path}")
+    except Exception as exc:
+        log.warn(f"Could not remove snapshot dir: {exc}")
+        return  # don't try to remove blobs if rmtree failed
+
+    # Remove orphaned blobs (link count == 1 means nothing else references them)
+    freed = 0
+    for blob in blobs_to_check:
+        try:
+            if os.path.exists(blob) and os.stat(blob).st_nlink == 1:
+                size = os.path.getsize(blob)
+                os.remove(blob)
+                freed += size
+        except Exception as exc:
+            log.warn(f"Could not remove blob {blob}: {exc}")
+
+    freed_gb = freed / (1024 ** 3)
+    log.info(f"Freed {freed_gb:.2f} GB by removing orphaned blobs.")
+
+
 def _check_write_quota(path: str) -> bool:
     """
     Return True if we can actually write to *path*.
@@ -663,10 +790,18 @@ async def handler(job):
 if __name__ == "__main__":
     # ---------------------------------------------------------------------------
     # Pre-flight: ensure the model is fully present on the volume.
-    # resolve_model_path() + validate_model_dir() run inside start_vllm_server(),
-    # but we need to intercept _IncompleteDownloadError *before* spawning vLLM so
-    # we can download the missing shards first.
     # ---------------------------------------------------------------------------
+    _hf_home    = os.environ.get("HF_HOME", "/runpod-volume/hf-cache")
+    _vol_root   = os.environ.get("VOLUME_PATH", "/runpod-volume")
+
+    # Show what's on the volume so quota surprises are immediately visible in logs
+    _report_volume_usage(_vol_root)
+
+    # Remove stale wrong-path cache dirs left by old buggy code
+    # (cache_dir=HF_HOME instead of HF_HOME/hub → models--* accumulate directly
+    #  under HF_HOME and silently consume quota across retries)
+    _purge_wrong_path_cache(_hf_home)
+
     _model_path = resolve_model_path()
 
     # Read model ID: env var wins, then fall back to config.yaml
@@ -682,10 +817,13 @@ if __name__ == "__main__":
     if _model_path:
         try:
             validate_model_dir(_model_path, _model_id)
-        except _IncompleteDownloadError:
-            log.info("Incomplete model detected — attempting auto-download to volume …")
+        except _IncompleteDownloadError as _exc:
+            log.info(
+                "Incomplete model detected — purging broken snapshot to free space, "
+                "then re-downloading missing shards …"
+            )
+            _purge_incomplete_snapshot(_exc.path)
             download_model_to_volume(_model_id or "unknown/model")
-            # Re-resolve after download (snapshot_download creates a new symlink tree)
             _model_path = resolve_model_path()
     else:
         # Model not found at all on the volume — download it from scratch.
