@@ -32,6 +32,77 @@ READY_TIMEOUT = int(os.environ.get("VLLM_READY_TIMEOUT", 900))  # seconds
 
 
 # ---------------------------------------------------------------------------
+# Custom exceptions
+# ---------------------------------------------------------------------------
+
+class _IncompleteDownloadError(Exception):
+    """Raised when the model directory exists but shards are missing/empty."""
+    def __init__(self, path: str, model_id: str | None):
+        self.path     = path
+        self.model_id = model_id
+        super().__init__(f"Incomplete model at {path!r} (model_id={model_id!r})")
+
+
+# ---------------------------------------------------------------------------
+# Auto-download helper
+# ---------------------------------------------------------------------------
+
+def download_model_to_volume(model_id: str) -> None:
+    """
+    Download (or resume) a HuggingFace model to the network volume.
+
+    Target directory: $HF_HOME  (default /runpod-volume/hf-cache)
+    Only .safetensors weights are fetched; .pt/.bin/original/* are skipped.
+    snapshot_download is idempotent — it skips files that are already present
+    and only fetches what is missing, so re-running after a quota error is safe.
+    """
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        log.error("huggingface_hub is not installed — cannot auto-download.")
+        sys.exit(1)
+
+    hf_home = os.environ.get("HF_HOME", "/runpod-volume/hf-cache")
+    token   = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+
+    # Make sure the target directory exists on the volume
+    os.makedirs(hf_home, exist_ok=True)
+
+    # Check free space (warn only — the download might still fit)
+    try:
+        st = os.statvfs(hf_home)
+        free_gb = st.f_bavail * st.f_frsize / (1024 ** 3)
+        log.info(f"Volume free space: {free_gb:.1f} GB  (cache dir: {hf_home})")
+        if free_gb < 20:
+            log.warn(
+                f"Only {free_gb:.1f} GB free — large models may fail. "
+                f"Free space on the volume before continuing."
+            )
+    except Exception:
+        pass
+
+    log.info(
+        f"Starting snapshot_download for {model_id!r}  →  HF_HOME={hf_home}\n"
+        f"This will only fetch files that are not already present (resume-safe)."
+    )
+
+    kwargs: dict = dict(
+        repo_id         = model_id,
+        ignore_patterns = ["*.pt", "*.bin", "original/*"],
+        cache_dir       = hf_home,
+    )
+    if token:
+        kwargs["token"] = token
+
+    try:
+        local_dir = snapshot_download(**kwargs)
+        log.info(f"Download complete → {local_dir}")
+    except Exception as exc:
+        log.error(f"snapshot_download failed: {exc}")
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
 # Startup helpers
 # ---------------------------------------------------------------------------
 
@@ -138,47 +209,82 @@ def validate_model_dir(path: str, expected_model_id: str | None = None) -> None:
         )
         sys.exit(1)
 
-    # ── Check weight files ─────────────────────────────────────────────────
+    # ── Shard index check (catches partial downloads immediately) ──────────
+    # model.safetensors.index.json lists every shard the full model needs.
+    # If it is present and some shards are missing, the download was cut short.
+    import json as _json
+
+    index_path = os.path.join(path, "model.safetensors.index.json")
+    real_index = os.path.realpath(index_path)
+    expected_shards: set[str] = set()
+
+    if os.path.isfile(real_index):
+        try:
+            with open(real_index) as f:
+                index_data = _json.load(f)
+            expected_shards = set(index_data.get("weight_map", {}).values())
+        except Exception as exc:
+            log.warn(f"Could not read shard index: {exc}")
+
+    if expected_shards:
+        missing, bad_size = [], []
+        for shard in sorted(expected_shards):
+            shard_path = os.path.join(path, shard)
+            real_shard = os.path.realpath(shard_path)
+            if not os.path.exists(real_shard):
+                missing.append(shard)
+            elif os.path.getsize(real_shard) == 0:
+                bad_size.append(shard)
+
+        if missing or bad_size:
+            problems = (
+                [f"  MISSING : {s}" for s in missing]
+                + [f"  EMPTY   : {s}" for s in bad_size]
+            )
+            log.warn(
+                f"INCOMPLETE DOWNLOAD — {len(missing)} missing + {len(bad_size)} empty "
+                f"shards out of {len(expected_shards)} total.\n"
+                + "\n".join(problems)
+            )
+            # Signal caller that the model needs (re-)downloading
+            raise _IncompleteDownloadError(path, expected_model_id)
+
+    # ── Check whatever weight files ARE present ────────────────────────────
     entries      = os.listdir(path)
     weight_files = [f for f in entries if any(f.endswith(e) for e in WEIGHT_EXTS)]
 
     if not weight_files:
-        log.error(
-            f"No weight files (.safetensors / .bin) found in {path!r}. "
-            f"The model may not have been downloaded."
-        )
-        sys.exit(1)
+        log.warn(f"No weight files (.safetensors / .bin) found in {path!r} — will download.")
+        raise _IncompleteDownloadError(path, expected_model_id)
 
     bad = []
     total_bytes = 0
     for fname in sorted(weight_files):
         fpath = os.path.join(path, fname)
-        real  = os.path.realpath(fpath)          # resolve HF-cache symlinks
+        real  = os.path.realpath(fpath)
         if not os.path.exists(real):
             bad.append(f"  {fname} → broken symlink ({real})")
         else:
             size = os.path.getsize(real)
             if size == 0:
-                bad.append(f"  {fname} → 0 bytes (download was cut short)")
+                bad.append(f"  {fname} → 0 bytes")
             else:
                 total_bytes += size
 
     if bad:
         log.error(
-            f"Incomplete download detected in {path!r}.\n"
-            f"Affected files:\n" + "\n".join(bad) + "\n"
-            f"Fix: delete the partial files and re-download to a volume with "
-            f"enough free space."
+            f"Corrupt/empty weight files in {path!r}:\n" + "\n".join(bad) + "\n"
+            f"Delete the snapshot and re-download."
         )
         sys.exit(1)
 
     total_gb = total_bytes / (1024 ** 3)
-    if total_gb < 1.0:
+
+    # Warn if we have no index file but the total size looks too small
+    if not expected_shards and total_gb < 10.0:
         log.warn(
-            f"Total weight size is only {total_gb:.2f} GB across "
-            f"{len(weight_files)} file(s) — this is suspiciously small for "
-            f"a model named {hf_name!r}. "
-            f"The volume may contain the wrong model."
+            f"Only {total_gb:.1f} GB found across {len(weight_files)} shard(s). "
+            f"This seems too small — the download may be incomplete."
         )
 
     log.info(
@@ -505,6 +611,44 @@ async def handler(job):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # ---------------------------------------------------------------------------
+    # Pre-flight: ensure the model is fully present on the volume.
+    # resolve_model_path() + validate_model_dir() run inside start_vllm_server(),
+    # but we need to intercept _IncompleteDownloadError *before* spawning vLLM so
+    # we can download the missing shards first.
+    # ---------------------------------------------------------------------------
+    _model_path = resolve_model_path()
+
+    # Read model ID: env var wins, then fall back to config.yaml
+    _model_id = os.environ.get("MODEL_NAME", "")
+    if not _model_id:
+        try:
+            import yaml as _yaml
+            with open(CONFIG_PATH) as _f:
+                _model_id = (_yaml.safe_load(_f) or {}).get("model", "")
+        except Exception:
+            _model_id = ""
+
+    if _model_path:
+        try:
+            validate_model_dir(_model_path, _model_id)
+        except _IncompleteDownloadError:
+            log.info("Incomplete model detected — attempting auto-download to volume …")
+            download_model_to_volume(_model_id or "unknown/model")
+            # Re-resolve after download (snapshot_download creates a new symlink tree)
+            _model_path = resolve_model_path()
+    else:
+        # Model not found at all on the volume — download it from scratch.
+        if _model_id:
+            log.info(f"Model {_model_id!r} not found on volume — downloading …")
+            download_model_to_volume(_model_id)
+            _model_path = resolve_model_path()
+        else:
+            log.warn(
+                "No model path resolved and MODEL_NAME is not set. "
+                "vLLM will use the model specified in config.yaml directly."
+            )
+
     # 1. Start vLLM (model loads here — ONCE for the entire worker lifetime)
     vllm_proc = start_vllm_server()
 
