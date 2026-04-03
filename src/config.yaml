@@ -6,17 +6,13 @@ host: "0.0.0.0"
 port: 8001
 tensor-parallel-size: 1      
 max-model-len: 65536
-gpu-memory-utilization: 0.95 
-enable-reasoning: true
-
-attention-config.backend: flash_attn
+gpu-memory-utilization: 0.95
 
 disable-log-stats: false
 uvicorn-log-level: info
 
-# tool-call-parser: 
 enable-auto-tool-choice: true
-tool-call-parser: qwen3_coder  
+tool-call-parser: qwen3_coder
 
 # PARALLEL REQUEST OPTIMIZATION
 # max-num-seqs: 64  

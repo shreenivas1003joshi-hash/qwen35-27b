@@ -88,6 +88,33 @@ def _report_volume_usage(volume_root: str) -> None:
     log.info("────────────────────────────────────────────")
 
 
+def _normalize_hf_home(hf_home: str) -> str:
+    """
+    Normalize HF_HOME so it always points to the *parent* of the hub/ directory.
+
+    huggingface_hub stores models at  {HF_HOME}/hub/models--{org}--{name}/
+    Users sometimes set HF_HOME to the hub/ directory itself
+    (e.g. HF_HOME=/runpod-volume/huggingface-cache/hub), which causes our code
+    to construct double paths like hub/hub/models--...
+
+    This function strips a trailing /hub component when the directory it points
+    to looks like a hub cache (contains models--* subdirectories directly).
+    """
+    p = hf_home.rstrip("/")
+    if not p.endswith("/hub"):
+        return p
+    # It ends in /hub — check whether models--* dirs live directly inside it
+    # (meaning it IS the hub dir, not the parent).
+    try:
+        entries = os.listdir(p)
+        if any(e.startswith("models--") for e in entries):
+            parent = p[: -len("/hub")]
+            return parent
+    except OSError:
+        pass
+    return p
+
+
 def _purge_wrong_path_cache(hf_home: str) -> None:
     """
     Delete stale cache directories that the old buggy code created at the wrong path.
@@ -225,7 +252,9 @@ def download_model_to_volume(model_id: str) -> None:
         log.error("huggingface_hub is not installed — cannot auto-download.")
         sys.exit(1)
 
-    hf_home  = os.environ.get("HF_HOME", "/runpod-volume/huggingface-cache")
+    hf_home  = _normalize_hf_home(
+        os.environ.get("HF_HOME", "/runpod-volume/huggingface-cache")
+    )
     hub_cache = os.path.join(hf_home, "hub")   # must match HF_HOME convention
     token    = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
 
@@ -589,7 +618,7 @@ def resolve_model_path() -> str | None:
         log.warn(f"MODEL_PATH={explicit!r} has no config.json — will try other locations.")
 
     # 2. HF_HOME — resolve to the exact snapshot to avoid ANY network call
-    hf_home = os.environ.get("HF_HOME", "").strip()
+    hf_home = _normalize_hf_home(os.environ.get("HF_HOME", "").strip())
     if hf_home:
         snap = _resolve_hf_snapshot(hf_home, model_hint)
         if snap:
@@ -627,8 +656,9 @@ def build_vllm_env(model_path: str | None) -> dict:
     """
     env = os.environ.copy()
 
-    hf_home = os.environ.get("HF_HOME", "").strip()
+    hf_home = _normalize_hf_home(os.environ.get("HF_HOME", "").strip())
     if hf_home:
+        # Propagate the *normalized* HF_HOME so vLLM uses the correct parent dir
         env["HF_HOME"] = hf_home
         env.setdefault("HF_DATASETS_CACHE", os.path.join(hf_home, "datasets"))
         log.info(f"HF_HOME  →  {hf_home}")
@@ -905,7 +935,9 @@ if __name__ == "__main__":
     # ---------------------------------------------------------------------------
     # Pre-flight: ensure the model is fully present on the volume.
     # ---------------------------------------------------------------------------
-    _hf_home    = os.environ.get("HF_HOME", "/runpod-volume/huggingface-cache")
+    _hf_home    = _normalize_hf_home(
+        os.environ.get("HF_HOME", "/runpod-volume/huggingface-cache")
+    )
     _vol_root   = os.environ.get("VOLUME_PATH", "/runpod-volume")
 
     # Show what's on the volume so quota surprises are immediately visible in logs
