@@ -5,9 +5,9 @@ model: Qwen/Qwen3.5-27B
 host: "0.0.0.0"
 port: 8001
 tensor-parallel-size: 1      
-max-model-len: 32768
+max-model-len: 65536
 gpu-memory-utilization: 0.95 
-enable-reasoning: false
+enable-reasoning: true
 
 attention-config.backend: flash_attn
 

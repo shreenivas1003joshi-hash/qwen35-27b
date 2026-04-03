@@ -30,8 +30,8 @@ VLLM_PORT   = int(os.environ.get("VLLM_PORT", 8001))
 VLLM_URL    = f"http://localhost:{VLLM_PORT}"
 READY_TIMEOUT = int(os.environ.get("VLLM_READY_TIMEOUT", 900))  # seconds
 
-# Set at startup once vLLM is launched; the handler rewrites the "model" field
-# in every request to this value so the name always matches what vLLM registered.
+# Populated by start_vllm_server(); the handler rewrites every request's
+# "model" field to this value so the name always matches what vLLM registered.
 _SERVED_MODEL_NAME: str = ""
 
 
@@ -667,13 +667,14 @@ def start_vllm_server() -> subprocess.Popen:
             expected_id = os.environ.get("MODEL_NAME")
         validate_model_dir(model_path, expected_model_id=expected_id)
 
-    # The human-readable model name used in API requests (the "model" field).
-    # When vLLM is given a local path via --model, it registers under that path.
-    # --served-model-name gives it a clean HuggingFace-style name instead so
-    # client requests with e.g. "model": "Qwen/Qwen3.5-27B" work correctly.
-    served_model_name = (
+    # --served-model-name gives vLLM a clean HuggingFace-style name to register
+    # under, instead of the raw local path.  Without this, requests that send
+    # "model": "Qwen/Qwen3.5-27B" get a 404 because vLLM registered the model
+    # under the full filesystem path.
+    global _SERVED_MODEL_NAME
+    _SERVED_MODEL_NAME = (
         os.environ.get("MODEL_NAME")
-        or (expected_id if model_path else None)
+        or expected_id
         or "default"
     )
 
@@ -681,36 +682,36 @@ def start_vllm_server() -> subprocess.Popen:
         sys.executable, "-m", "vllm.entrypoints.openai.api_server",
         "--config", CONFIG_PATH,
         "--tensor-parallel-size", str(tp),
-        "--served-model-name", served_model_name,
+        "--served-model-name", _SERVED_MODEL_NAME,
     ]
 
     if model_path:
         cmd += ["--model", model_path]
 
-    global _SERVED_MODEL_NAME
-    _SERVED_MODEL_NAME = served_model_name
-
     log.info(f"Available GPUs: {available_gpus()} | tensor-parallel-size: {tp}")
-    log.info(f"Served model name: {served_model_name}")
+    log.info(f"Served model name: {_SERVED_MODEL_NAME}")
     log.info(f"vLLM command: {' '.join(cmd)}")
     return subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr, env=env)
 
 
 async def wait_for_vllm(proc: subprocess.Popen, timeout: int = READY_TIMEOUT) -> None:
     """
-    Block until vLLM is truly ready to serve inference — not just HTTP-up.
+    Block until vLLM has the model in VRAM and is ready to serve inference.
 
-    vLLM's /health returns 200 as soon as the HTTP server starts, long before
-    model weights are in VRAM.  /v1/models returns the model entry as soon as
-    it is *configured*, not when weights are loaded.  The only reliable signal
-    is a successful inference response.
+    Why /health is not enough
+    ─────────────────────────
+    vLLM's /health returns 200 as soon as the HTTP server process starts —
+    this happens within seconds, long before the model weights are loaded into
+    VRAM (which takes 100-300 s for large models).  A worker that signals
+    RunPod "ready" after /health will receive jobs while the model is still
+    loading, making every request wait for the load.
 
-    Sequence (all phases share the same deadline):
-      1. Poll /health  — wait for the HTTP server to start.
-      2. Poll /v1/models — wait for the model to be configured.
-      3. Warmup inference — send max_tokens=1 and wait for a 200 response.
-         This blocks until weights are in VRAM and CUDA graphs are compiled,
-         guaranteeing zero load latency on the first real request.
+    Three-phase sequence (all phases share the same deadline):
+      1. /health       — HTTP server is alive.
+      2. /v1/models    — model entry is registered (config is parsed).
+      3. Warmup POST   — actual inference succeeds.
+         This is the ONLY reliable signal that weights are in VRAM and CUDA
+         graphs are compiled.  Only after this returns 200 do we signal RunPod.
     """
     import aiohttp
 
@@ -744,7 +745,6 @@ async def wait_for_vllm(proc: subprocess.Popen, timeout: int = READY_TIMEOUT) ->
         sys.exit(1)
 
     # ── Phase 2: Model entry registered ──────────────────────────────────────
-    # (This passes quickly — it only confirms the model is configured, not loaded.)
     while loop.time() < deadline:
         _check_proc()
         try:
@@ -768,17 +768,20 @@ async def wait_for_vllm(proc: subprocess.Popen, timeout: int = READY_TIMEOUT) ->
         sys.exit(1)
 
     # ── Phase 3: Warmup inference ─────────────────────────────────────────────
-    # This is the ONLY reliable signal that weights are in VRAM and CUDA graphs
-    # are compiled.  We keep retrying until deadline (not a separate 120s cap)
-    # so large models that take 200-300s to load don't time out prematurely.
-    log.info("Sending warmup inference request (this blocks until model is in VRAM) …")
+    # Keep retrying until the shared deadline (NOT a separate short timeout).
+    # Large models need 100-300 s to load; a fixed 120 s cap would kill the
+    # worker before the load finishes.  The warmup request itself is held open
+    # for the full remaining time so it is not cancelled while weights load.
+    log.info(
+        "Sending warmup inference (max_tokens=1) — "
+        "this blocks until model is fully in VRAM …"
+    )
     warmup_body = {
         "model":      _SERVED_MODEL_NAME or "default",
         "messages":   [{"role": "user", "content": "Hi"}],
         "max_tokens": 1,
         "stream":     False,
     }
-    warmup_logged = False
     while loop.time() < deadline:
         _check_proc()
         remaining = int(deadline - loop.time())
@@ -787,25 +790,23 @@ async def wait_for_vllm(proc: subprocess.Popen, timeout: int = READY_TIMEOUT) ->
                 async with s.post(
                     f"{VLLM_URL}/v1/chat/completions",
                     json=warmup_body,
-                    # Give each single attempt up to the full remaining time so
-                    # the request isn't cancelled mid-flight while weights load.
                     timeout=aiohttp.ClientTimeout(total=max(remaining, 10)),
                 ) as r:
                     if r.status == 200:
-                        log.info("Warmup complete — model is in VRAM, worker is ready.")
+                        log.info(
+                            "Warmup complete — model is in VRAM, "
+                            "worker is ready to serve requests."
+                        )
                         return
                     text = await r.text()
-                    if not warmup_logged:
-                        log.info(
-                            f"Warmup queued (HTTP {r.status}) — "
-                            f"model still loading, {remaining}s remaining …"
-                        )
-                        warmup_logged = True
+                    log.info(
+                        f"Warmup queued (HTTP {r.status}) — "
+                        f"model still loading, {remaining}s remaining …"
+                    )
         except asyncio.TimeoutError:
             log.info(f"Warmup still waiting for model ({remaining}s remaining) …")
-            warmup_logged = False  # reset so next loop logs again
         except Exception as exc:
-            log.warn(f"Warmup request error: {exc}")
+            log.warn(f"Warmup attempt error: {exc}")
         await asyncio.sleep(5)
 
     log.error(f"Model did not become ready within {timeout}s.")
@@ -853,9 +854,9 @@ async def handler(job):
     job_input = job.get("input", {})
     route, body = resolve_route_and_body(job_input)
 
-    # Always overwrite "model" with the name vLLM is actually serving.
-    # Without this, requests that omit "model" or use the HuggingFace ID get a
-    # 404 when vLLM was loaded from a local path and registered under that path.
+    # Overwrite "model" with the name vLLM is actually serving.
+    # Without this, requests that use "Qwen/Qwen3.5-27B" get a 404 because
+    # vLLM registered the model under its local filesystem path.
     if _SERVED_MODEL_NAME:
         body = {**body, "model": _SERVED_MODEL_NAME}
 
