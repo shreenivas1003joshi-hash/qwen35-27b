@@ -511,19 +511,39 @@ def _resolve_hf_snapshot(hf_home: str, model_id: str) -> str | None:
 
     HF cache layout:
       <hf_home>/hub/models--<org>--<name>/
-        refs/main          ← contains the commit hash
+        refs/main          ← contains the commit hash (may be missing if EDQUOT hit)
         snapshots/<hash>/  ← actual model files
+
+    The directory name is matched case-insensitively because some versions of
+    huggingface_hub normalize to lowercase (models--qwen--qwen3.5-27b).
+    refs/main is optional — we fall back to scanning snapshots/ directly.
     """
     if "/" not in model_id:
         return None
     org, name = model_id.split("/", 1)
     hub_dir = os.path.join(hf_home, "hub")
-    model_cache = os.path.join(hub_dir, f"models--{org}--{name}")
 
-    if not os.path.isdir(model_cache):
+    if not os.path.isdir(hub_dir):
         return None
 
-    # Prefer the hash recorded in refs/main
+    # Locate the model cache dir — try exact case first, then case-insensitive.
+    target_name = f"models--{org}--{name}"
+    model_cache  = os.path.join(hub_dir, target_name)
+
+    if not os.path.isdir(model_cache):
+        target_lower = target_name.lower()
+        try:
+            for entry in os.listdir(hub_dir):
+                if (entry.lower() == target_lower
+                        and os.path.isdir(os.path.join(hub_dir, entry))):
+                    model_cache = os.path.join(hub_dir, entry)
+                    break
+            else:
+                return None
+        except OSError:
+            return None
+
+    # Prefer the hash recorded in refs/main (may be absent if EDQUOT hit it)
     refs_main = os.path.join(model_cache, "refs", "main")
     if os.path.isfile(refs_main):
         try:
@@ -534,7 +554,7 @@ def _resolve_hf_snapshot(hf_home: str, model_id: str) -> str | None:
         except OSError:
             pass
 
-    # Fall back: pick newest snapshot directory that has a config.json
+    # Fall back: pick the newest snapshot directory that has a config.json
     snaps_dir = os.path.join(model_cache, "snapshots")
     if os.path.isdir(snaps_dir):
         for snap in sorted(os.listdir(snaps_dir), reverse=True):
@@ -569,11 +589,12 @@ def _find_model_on_volume(volume_root: str, hint: str) -> str | None:
         if _has_config_json(path):
             return path
 
-    # HF cache layouts — check common cache directory names under the volume root
+    # HF cache layouts — check all common cache directory names under the volume root
     for hf_home in [
         volume_root,
         os.path.join(volume_root, "huggingface-cache"),
         os.path.join(volume_root, "hf-cache"),
+        os.path.join(volume_root, "hf_cache"),
         os.path.join(volume_root, "huggingface"),
     ]:
         snap = _resolve_hf_snapshot(hf_home, hint)
@@ -943,9 +964,23 @@ if __name__ == "__main__":
     # Show what's on the volume so quota surprises are immediately visible in logs
     _report_volume_usage(_vol_root)
 
-    # Remove stale wrong-path cache dirs left by old buggy code
-    # (cache_dir=HF_HOME instead of HF_HOME/hub → models--* accumulate directly
-    #  under HF_HOME and silently consume quota across retries)
+    # ── Automatic stale-cache cleanup ─────────────────────────────────────────
+    # /runpod-volume/hf-cache (hyphen) was the old default cache_dir used by
+    # buggy versions of this handler.  It is never the active HF_HOME, so it is
+    # safe to delete unconditionally and frees quota for the actual download.
+    _stale_hyphen = os.path.join(_vol_root, "hf-cache")
+    if os.path.isdir(_stale_hyphen) and _stale_hyphen != _hf_home:
+        import shutil as _shutil
+        _sz = _dir_size_gb(_stale_hyphen)
+        log.info(f"Auto-removing stale cache (old default): {_stale_hyphen}  ({_sz:.2f} GB)")
+        try:
+            _shutil.rmtree(_stale_hyphen)
+            log.info(f"Freed {_sz:.2f} GB by removing {_stale_hyphen}")
+        except Exception as _e:
+            log.warn(f"Could not remove {_stale_hyphen}: {_e}")
+
+    # Remove models--* dirs that ended up directly under HF_HOME (not under hub/)
+    # due to cache_dir=HF_HOME bug in older versions of this handler.
     _purge_wrong_path_cache(_hf_home)
 
     _model_path = resolve_model_path()
