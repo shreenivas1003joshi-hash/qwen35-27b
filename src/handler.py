@@ -690,6 +690,20 @@ def build_vllm_env(model_path: str | None) -> dict:
         env["HF_HUB_OFFLINE"] = "1"
         env["TRANSFORMERS_OFFLINE"] = "1"
         log.info("Offline mode: HF_HUB_OFFLINE=1, TRANSFORMERS_OFFLINE=1")
+
+    # Persist torch.compile and vLLM kernel caches on the network volume so
+    # they survive container restarts.  Without this, torch.compile re-runs
+    # from scratch on every cold start (~40 s for Qwen3.5-27B).
+    vol = os.environ.get("VOLUME_PATH", "/runpod-volume")
+    vllm_cache = os.path.join(vol, ".vllm-cache")
+    try:
+        os.makedirs(vllm_cache, exist_ok=True)
+        env["VLLM_CACHE_ROOT"] = vllm_cache
+        env.setdefault("TRITON_CACHE_DIR", os.path.join(vllm_cache, "triton"))
+        log.info(f"Compile cache  →  {vllm_cache}")
+    except OSError:
+        pass  # volume not mounted or read-only — use the container default
+
     return env
 
 

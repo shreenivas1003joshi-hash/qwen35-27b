@@ -1,10 +1,10 @@
 # Model source (overridable at runtime via RunPod env vars):
 #   MODEL_PATH=/runpod-volume/models/Qwen3.5-27B   → load weights directly from volume
 #   HF_HOME=/runpod-volume/hf-cache                → resolve this HF ID from volume cache
-model: Qwen/Qwen3.5-27B
+# model and tensor-parallel-size are injected at runtime by handler.py
+# (model → resolved local snapshot path; tensor-parallel-size → auto-detected GPU count)
 host: "0.0.0.0"
 port: 8001
-tensor-parallel-size: 1      
 max-model-len: 65536
 gpu-memory-utilization: 0.95
 
