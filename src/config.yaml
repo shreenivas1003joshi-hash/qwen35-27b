@@ -12,7 +12,7 @@ port: 8001
 
 # Gemma 4 supports up to 131072 tokens but 32768 is recommended for single-GPU
 # to maximise KV cache capacity. Increase if you need longer contexts.
-max-model-len: 32768
+max-model-len: 65536
 gpu-memory-utilization: 0.90
 
 disable-log-stats: false
