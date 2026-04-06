@@ -1,4 +1,4 @@
-FROM vllm/vllm-openai:nightly
+FROM vllm/vllm-openai:gemma4
 
 WORKDIR /app
 

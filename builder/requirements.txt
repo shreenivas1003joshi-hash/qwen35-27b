@@ -1,6 +1,10 @@
-# vLLM is already installed in the base image (vllm/vllm-openai:nightly)
+# vLLM is already installed in the base image (vllm/vllm-openai:gemma4)
 runpod>=1.7.0
 aiohttp>=3.9.0
 huggingface_hub>=0.24.0
 pyyaml>=6.0
 boto3>=1.34.0       # S3-compatible access to RunPod network volumes
+
+# Gemma 4 requires transformers>=5.5.0 for the gemma4 architecture type.
+# The nightly vLLM image may ship an older version — this ensures the minimum.
+transformers>=5.5.0
