@@ -30,8 +30,8 @@ VLLM_PORT   = int(os.environ.get("VLLM_PORT", 8001))
 VLLM_URL    = f"http://localhost:{VLLM_PORT}"
 READY_TIMEOUT = int(os.environ.get("VLLM_READY_TIMEOUT", 900))  # seconds
 
-# Set at startup once vLLM is launched; the handler rewrites the "model" field
-# in every request to this value so the name always matches what vLLM registered.
+# Populated by start_vllm_server(); the handler rewrites every request's
+# "model" field to this value so the name always matches what vLLM registered.
 _SERVED_MODEL_NAME: str = ""
 
 
@@ -86,6 +86,33 @@ def _report_volume_usage(volume_root: str) -> None:
     except OSError as exc:
         log.warn(f"Could not scan {volume_root}: {exc}")
     log.info("────────────────────────────────────────────")
+
+
+def _normalize_hf_home(hf_home: str) -> str:
+    """
+    Normalize HF_HOME so it always points to the *parent* of the hub/ directory.
+
+    huggingface_hub stores models at  {HF_HOME}/hub/models--{org}--{name}/
+    Users sometimes set HF_HOME to the hub/ directory itself
+    (e.g. HF_HOME=/runpod-volume/huggingface-cache/hub), which causes our code
+    to construct double paths like hub/hub/models--...
+
+    This function strips a trailing /hub component when the directory it points
+    to looks like a hub cache (contains models--* subdirectories directly).
+    """
+    p = hf_home.rstrip("/")
+    if not p.endswith("/hub"):
+        return p
+    # It ends in /hub — check whether models--* dirs live directly inside it
+    # (meaning it IS the hub dir, not the parent).
+    try:
+        entries = os.listdir(p)
+        if any(e.startswith("models--") for e in entries):
+            parent = p[: -len("/hub")]
+            return parent
+    except OSError:
+        pass
+    return p
 
 
 def _purge_wrong_path_cache(hf_home: str) -> None:
@@ -225,7 +252,9 @@ def download_model_to_volume(model_id: str) -> None:
         log.error("huggingface_hub is not installed — cannot auto-download.")
         sys.exit(1)
 
-    hf_home  = os.environ.get("HF_HOME", "/runpod-volume/huggingface-cache")
+    hf_home  = _normalize_hf_home(
+        os.environ.get("HF_HOME", "/runpod-volume/huggingface-cache")
+    )
     hub_cache = os.path.join(hf_home, "hub")   # must match HF_HOME convention
     token    = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
 
@@ -482,19 +511,39 @@ def _resolve_hf_snapshot(hf_home: str, model_id: str) -> str | None:
 
     HF cache layout:
       <hf_home>/hub/models--<org>--<name>/
-        refs/main          ← contains the commit hash
+        refs/main          ← contains the commit hash (may be missing if EDQUOT hit)
         snapshots/<hash>/  ← actual model files
+
+    The directory name is matched case-insensitively because some versions of
+    huggingface_hub normalize to lowercase (models--qwen--qwen3.5-27b).
+    refs/main is optional — we fall back to scanning snapshots/ directly.
     """
     if "/" not in model_id:
         return None
     org, name = model_id.split("/", 1)
     hub_dir = os.path.join(hf_home, "hub")
-    model_cache = os.path.join(hub_dir, f"models--{org}--{name}")
 
-    if not os.path.isdir(model_cache):
+    if not os.path.isdir(hub_dir):
         return None
 
-    # Prefer the hash recorded in refs/main
+    # Locate the model cache dir — try exact case first, then case-insensitive.
+    target_name = f"models--{org}--{name}"
+    model_cache  = os.path.join(hub_dir, target_name)
+
+    if not os.path.isdir(model_cache):
+        target_lower = target_name.lower()
+        try:
+            for entry in os.listdir(hub_dir):
+                if (entry.lower() == target_lower
+                        and os.path.isdir(os.path.join(hub_dir, entry))):
+                    model_cache = os.path.join(hub_dir, entry)
+                    break
+            else:
+                return None
+        except OSError:
+            return None
+
+    # Prefer the hash recorded in refs/main (may be absent if EDQUOT hit it)
     refs_main = os.path.join(model_cache, "refs", "main")
     if os.path.isfile(refs_main):
         try:
@@ -505,7 +554,7 @@ def _resolve_hf_snapshot(hf_home: str, model_id: str) -> str | None:
         except OSError:
             pass
 
-    # Fall back: pick newest snapshot directory that has a config.json
+    # Fall back: pick the newest snapshot directory that has a config.json
     snaps_dir = os.path.join(model_cache, "snapshots")
     if os.path.isdir(snaps_dir):
         for snap in sorted(os.listdir(snaps_dir), reverse=True):
@@ -540,11 +589,12 @@ def _find_model_on_volume(volume_root: str, hint: str) -> str | None:
         if _has_config_json(path):
             return path
 
-    # HF cache layouts — check common cache directory names under the volume root
+    # HF cache layouts — check all common cache directory names under the volume root
     for hf_home in [
         volume_root,
         os.path.join(volume_root, "huggingface-cache"),
         os.path.join(volume_root, "hf-cache"),
+        os.path.join(volume_root, "hf_cache"),
         os.path.join(volume_root, "huggingface"),
     ]:
         snap = _resolve_hf_snapshot(hf_home, hint)
@@ -589,7 +639,7 @@ def resolve_model_path() -> str | None:
         log.warn(f"MODEL_PATH={explicit!r} has no config.json — will try other locations.")
 
     # 2. HF_HOME — resolve to the exact snapshot to avoid ANY network call
-    hf_home = os.environ.get("HF_HOME", "").strip()
+    hf_home = _normalize_hf_home(os.environ.get("HF_HOME", "").strip())
     if hf_home:
         snap = _resolve_hf_snapshot(hf_home, model_hint)
         if snap:
@@ -627,8 +677,9 @@ def build_vllm_env(model_path: str | None) -> dict:
     """
     env = os.environ.copy()
 
-    hf_home = os.environ.get("HF_HOME", "").strip()
+    hf_home = _normalize_hf_home(os.environ.get("HF_HOME", "").strip())
     if hf_home:
+        # Propagate the *normalized* HF_HOME so vLLM uses the correct parent dir
         env["HF_HOME"] = hf_home
         env.setdefault("HF_DATASETS_CACHE", os.path.join(hf_home, "datasets"))
         log.info(f"HF_HOME  →  {hf_home}")
@@ -639,6 +690,20 @@ def build_vllm_env(model_path: str | None) -> dict:
         env["HF_HUB_OFFLINE"] = "1"
         env["TRANSFORMERS_OFFLINE"] = "1"
         log.info("Offline mode: HF_HUB_OFFLINE=1, TRANSFORMERS_OFFLINE=1")
+
+    # Persist torch.compile and vLLM kernel caches on the network volume so
+    # they survive container restarts.  Without this, torch.compile re-runs
+    # from scratch on every cold start (~40 s for Qwen3.5-27B).
+    vol = os.environ.get("VOLUME_PATH", "/runpod-volume")
+    vllm_cache = os.path.join(vol, ".vllm-cache")
+    try:
+        os.makedirs(vllm_cache, exist_ok=True)
+        env["VLLM_CACHE_ROOT"] = vllm_cache
+        env.setdefault("TRITON_CACHE_DIR", os.path.join(vllm_cache, "triton"))
+        log.info(f"Compile cache  →  {vllm_cache}")
+    except OSError:
+        pass  # volume not mounted or read-only — use the container default
+
     return env
 
 
@@ -667,13 +732,14 @@ def start_vllm_server() -> subprocess.Popen:
             expected_id = os.environ.get("MODEL_NAME")
         validate_model_dir(model_path, expected_model_id=expected_id)
 
-    # The human-readable model name used in API requests (the "model" field).
-    # When vLLM is given a local path via --model, it registers under that path.
-    # --served-model-name gives it a clean HuggingFace-style name instead so
-    # client requests with e.g. "model": "Qwen/Qwen3.5-27B" work correctly.
-    served_model_name = (
+    # --served-model-name gives vLLM a clean HuggingFace-style name to register
+    # under, instead of the raw local path.  Without this, requests that send
+    # "model": "Qwen/Qwen3.5-27B" get a 404 because vLLM registered the model
+    # under the full filesystem path.
+    global _SERVED_MODEL_NAME
+    _SERVED_MODEL_NAME = (
         os.environ.get("MODEL_NAME")
-        or (expected_id if model_path else None)
+        or expected_id
         or "default"
     )
 
@@ -681,36 +747,36 @@ def start_vllm_server() -> subprocess.Popen:
         sys.executable, "-m", "vllm.entrypoints.openai.api_server",
         "--config", CONFIG_PATH,
         "--tensor-parallel-size", str(tp),
-        "--served-model-name", served_model_name,
+        "--served-model-name", _SERVED_MODEL_NAME,
     ]
 
     if model_path:
         cmd += ["--model", model_path]
 
-    global _SERVED_MODEL_NAME
-    _SERVED_MODEL_NAME = served_model_name
-
     log.info(f"Available GPUs: {available_gpus()} | tensor-parallel-size: {tp}")
-    log.info(f"Served model name: {served_model_name}")
+    log.info(f"Served model name: {_SERVED_MODEL_NAME}")
     log.info(f"vLLM command: {' '.join(cmd)}")
     return subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr, env=env)
 
 
 async def wait_for_vllm(proc: subprocess.Popen, timeout: int = READY_TIMEOUT) -> None:
     """
-    Block until vLLM is truly ready to serve inference — not just HTTP-up.
+    Block until vLLM has the model in VRAM and is ready to serve inference.
 
-    vLLM's /health returns 200 as soon as the HTTP server starts, long before
-    model weights are in VRAM.  /v1/models returns the model entry as soon as
-    it is *configured*, not when weights are loaded.  The only reliable signal
-    is a successful inference response.
+    Why /health is not enough
+    ─────────────────────────
+    vLLM's /health returns 200 as soon as the HTTP server process starts —
+    this happens within seconds, long before the model weights are loaded into
+    VRAM (which takes 100-300 s for large models).  A worker that signals
+    RunPod "ready" after /health will receive jobs while the model is still
+    loading, making every request wait for the load.
 
-    Sequence (all phases share the same deadline):
-      1. Poll /health  — wait for the HTTP server to start.
-      2. Poll /v1/models — wait for the model to be configured.
-      3. Warmup inference — send max_tokens=1 and wait for a 200 response.
-         This blocks until weights are in VRAM and CUDA graphs are compiled,
-         guaranteeing zero load latency on the first real request.
+    Three-phase sequence (all phases share the same deadline):
+      1. /health       — HTTP server is alive.
+      2. /v1/models    — model entry is registered (config is parsed).
+      3. Warmup POST   — actual inference succeeds.
+         This is the ONLY reliable signal that weights are in VRAM and CUDA
+         graphs are compiled.  Only after this returns 200 do we signal RunPod.
     """
     import aiohttp
 
@@ -744,7 +810,6 @@ async def wait_for_vllm(proc: subprocess.Popen, timeout: int = READY_TIMEOUT) ->
         sys.exit(1)
 
     # ── Phase 2: Model entry registered ──────────────────────────────────────
-    # (This passes quickly — it only confirms the model is configured, not loaded.)
     while loop.time() < deadline:
         _check_proc()
         try:
@@ -768,17 +833,20 @@ async def wait_for_vllm(proc: subprocess.Popen, timeout: int = READY_TIMEOUT) ->
         sys.exit(1)
 
     # ── Phase 3: Warmup inference ─────────────────────────────────────────────
-    # This is the ONLY reliable signal that weights are in VRAM and CUDA graphs
-    # are compiled.  We keep retrying until deadline (not a separate 120s cap)
-    # so large models that take 200-300s to load don't time out prematurely.
-    log.info("Sending warmup inference request (this blocks until model is in VRAM) …")
+    # Keep retrying until the shared deadline (NOT a separate short timeout).
+    # Large models need 100-300 s to load; a fixed 120 s cap would kill the
+    # worker before the load finishes.  The warmup request itself is held open
+    # for the full remaining time so it is not cancelled while weights load.
+    log.info(
+        "Sending warmup inference (max_tokens=1) — "
+        "this blocks until model is fully in VRAM …"
+    )
     warmup_body = {
         "model":      _SERVED_MODEL_NAME or "default",
         "messages":   [{"role": "user", "content": "Hi"}],
         "max_tokens": 1,
         "stream":     False,
     }
-    warmup_logged = False
     while loop.time() < deadline:
         _check_proc()
         remaining = int(deadline - loop.time())
@@ -787,25 +855,23 @@ async def wait_for_vllm(proc: subprocess.Popen, timeout: int = READY_TIMEOUT) ->
                 async with s.post(
                     f"{VLLM_URL}/v1/chat/completions",
                     json=warmup_body,
-                    # Give each single attempt up to the full remaining time so
-                    # the request isn't cancelled mid-flight while weights load.
                     timeout=aiohttp.ClientTimeout(total=max(remaining, 10)),
                 ) as r:
                     if r.status == 200:
-                        log.info("Warmup complete — model is in VRAM, worker is ready.")
+                        log.info(
+                            "Warmup complete — model is in VRAM, "
+                            "worker is ready to serve requests."
+                        )
                         return
                     text = await r.text()
-                    if not warmup_logged:
-                        log.info(
-                            f"Warmup queued (HTTP {r.status}) — "
-                            f"model still loading, {remaining}s remaining …"
-                        )
-                        warmup_logged = True
+                    log.info(
+                        f"Warmup queued (HTTP {r.status}) — "
+                        f"model still loading, {remaining}s remaining …"
+                    )
         except asyncio.TimeoutError:
             log.info(f"Warmup still waiting for model ({remaining}s remaining) …")
-            warmup_logged = False  # reset so next loop logs again
         except Exception as exc:
-            log.warn(f"Warmup request error: {exc}")
+            log.warn(f"Warmup attempt error: {exc}")
         await asyncio.sleep(5)
 
     log.error(f"Model did not become ready within {timeout}s.")
@@ -853,9 +919,9 @@ async def handler(job):
     job_input = job.get("input", {})
     route, body = resolve_route_and_body(job_input)
 
-    # Always overwrite "model" with the name vLLM is actually serving.
-    # Without this, requests that omit "model" or use the HuggingFace ID get a
-    # 404 when vLLM was loaded from a local path and registered under that path.
+    # Overwrite "model" with the name vLLM is actually serving.
+    # Without this, requests that use "Qwen/Qwen3.5-27B" get a 404 because
+    # vLLM registered the model under its local filesystem path.
     if _SERVED_MODEL_NAME:
         body = {**body, "model": _SERVED_MODEL_NAME}
 
@@ -904,15 +970,31 @@ if __name__ == "__main__":
     # ---------------------------------------------------------------------------
     # Pre-flight: ensure the model is fully present on the volume.
     # ---------------------------------------------------------------------------
-    _hf_home    = os.environ.get("HF_HOME", "/runpod-volume/huggingface-cache")
+    _hf_home    = _normalize_hf_home(
+        os.environ.get("HF_HOME", "/runpod-volume/huggingface-cache")
+    )
     _vol_root   = os.environ.get("VOLUME_PATH", "/runpod-volume")
 
     # Show what's on the volume so quota surprises are immediately visible in logs
     _report_volume_usage(_vol_root)
 
-    # Remove stale wrong-path cache dirs left by old buggy code
-    # (cache_dir=HF_HOME instead of HF_HOME/hub → models--* accumulate directly
-    #  under HF_HOME and silently consume quota across retries)
+    # ── Automatic stale-cache cleanup ─────────────────────────────────────────
+    # /runpod-volume/hf-cache (hyphen) was the old default cache_dir used by
+    # buggy versions of this handler.  It is never the active HF_HOME, so it is
+    # safe to delete unconditionally and frees quota for the actual download.
+    _stale_hyphen = os.path.join(_vol_root, "hf-cache")
+    if os.path.isdir(_stale_hyphen) and _stale_hyphen != _hf_home:
+        import shutil as _shutil
+        _sz = _dir_size_gb(_stale_hyphen)
+        log.info(f"Auto-removing stale cache (old default): {_stale_hyphen}  ({_sz:.2f} GB)")
+        try:
+            _shutil.rmtree(_stale_hyphen)
+            log.info(f"Freed {_sz:.2f} GB by removing {_stale_hyphen}")
+        except Exception as _e:
+            log.warn(f"Could not remove {_stale_hyphen}: {_e}")
+
+    # Remove models--* dirs that ended up directly under HF_HOME (not under hub/)
+    # due to cache_dir=HF_HOME bug in older versions of this handler.
     _purge_wrong_path_cache(_hf_home)
 
     _model_path = resolve_model_path()

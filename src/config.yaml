@@ -28,6 +28,6 @@ max-num-seqs: 16
 max-num-batched-tokens: 8192
 enable-chunked-prefill: true
 
-# Skip multimodal (image/audio) profiling for text-only workloads.
-# Remove this line if you want to use Gemma 4's vision/audio capabilities.
-limit-mm-per-prompt: "image=0,audio=0"
+# Text-only mode — skips loading vision/audio encoder components entirely.
+# This saves VRAM and speeds up startup. Remove to enable image/audio inputs.
+language-model-only: true
