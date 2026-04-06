@@ -1,28 +1,33 @@
-# Model source (overridable at runtime via RunPod env vars):
-#   MODEL_PATH=/runpod-volume/models/Qwen3.5-27B   → load weights directly from volume
-#   HF_HOME=/runpod-volume/hf-cache                → resolve this HF ID from volume cache
-model: Qwen/Qwen3.5-27B
+# Model and tensor-parallel-size are injected at runtime by handler.py:
+#   model              → resolved local snapshot path on the volume
+#   tensor-parallel-size → auto-detected GPU count
+#
+# Set these RunPod env vars to control which model is used:
+#   MODEL_NAME=google/gemma-4-31B-it          (dense 31B, 1× 80GB GPU)
+#   MODEL_NAME=google/gemma-4-26B-A4B-it      (MoE 26B/4B active, 1× 80GB GPU, faster)
+#   HF_HOME=/runpod-volume/huggingface-cache  (where model is cached on the volume)
+
 host: "0.0.0.0"
 port: 8001
-tensor-parallel-size: 1      
-max-model-len: 32768
-gpu-memory-utilization: 0.95 
-enable-reasoning: false
 
-attention-config.backend: flash_attn
+# Gemma 4 supports up to 131072 tokens but 32768 is recommended for single-GPU
+# to maximise KV cache capacity. Increase if you need longer contexts.
+max-model-len: 32768
+gpu-memory-utilization: 0.90
 
 disable-log-stats: false
 uvicorn-log-level: info
 
-# tool-call-parser: 
+# Gemma 4 tool calling and reasoning (thinking mode)
 enable-auto-tool-choice: true
-tool-call-parser: qwen3_coder  
+tool-call-parser: gemma4
+reasoning-parser: gemma4
 
-# PARALLEL REQUEST OPTIMIZATION
-# max-num-seqs: 64  
-max-num-seqs: 16                    
-max-num-batched-tokens: 8192        
-enable-chunked-prefill: true       
+# Throughput tuning
+max-num-seqs: 16
+max-num-batched-tokens: 8192
+enable-chunked-prefill: true
 
-# disable multi modal
-language-model-only: true
+# Skip multimodal (image/audio) profiling for text-only workloads.
+# Remove this line if you want to use Gemma 4's vision/audio capabilities.
+limit-mm-per-prompt: "image=0,audio=0"

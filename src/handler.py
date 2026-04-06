@@ -936,7 +936,7 @@ if __name__ == "__main__":
                 "then re-downloading missing shards …"
             )
             _purge_incomplete_snapshot(_exc.path)
-            download_model_to_volume(_model_id or "unknown/model")
+            download_model_to_volume(_model_id or "google/gemma-4-31B-it")
             _model_path = resolve_model_path()
     else:
         # Model not found at all on the volume — download it from scratch.
