@@ -719,29 +719,26 @@ def start_vllm_server() -> subprocess.Popen:
     model_path = resolve_model_path()
     env        = build_vllm_env(model_path)
 
-    # Validate before handing off to vLLM.
-    # Passes the expected model ID so a wrong-model-in-volume mismatch is
-    # caught here with a clear message instead of inside the EngineCore.
+    # Resolve the expected model ID from env var or config.yaml.
+    # Done unconditionally so _SERVED_MODEL_NAME is always valid.
+    import yaml as _yaml
+    try:
+        with open(CONFIG_PATH) as _f:
+            _cfg = _yaml.safe_load(_f) or {}
+        expected_id: str = os.environ.get("MODEL_NAME") or _cfg.get("model") or ""
+    except Exception:
+        expected_id = os.environ.get("MODEL_NAME") or ""
+
+    # Validate model directory before handing off to vLLM.
     if model_path:
-        import yaml
-        try:
-            with open(CONFIG_PATH) as f:
-                _cfg = yaml.safe_load(f) or {}
-            expected_id = os.environ.get("MODEL_NAME") or _cfg.get("model")
-        except Exception:
-            expected_id = os.environ.get("MODEL_NAME")
-        validate_model_dir(model_path, expected_model_id=expected_id)
+        validate_model_dir(model_path, expected_model_id=expected_id or None)
 
     # --served-model-name gives vLLM a clean HuggingFace-style name to register
     # under, instead of the raw local path.  Without this, requests that send
-    # "model": "Qwen/Qwen3.5-27B" get a 404 because vLLM registered the model
-    # under the full filesystem path.
+    # e.g. "model": "google/gemma-4-31B-it" get a 404 because vLLM registered
+    # the model under the full filesystem path.
     global _SERVED_MODEL_NAME
-    _SERVED_MODEL_NAME = (
-        os.environ.get("MODEL_NAME")
-        or expected_id
-        or "default"
-    )
+    _SERVED_MODEL_NAME = expected_id or "default"
 
     cmd = [
         sys.executable, "-m", "vllm.entrypoints.openai.api_server",
